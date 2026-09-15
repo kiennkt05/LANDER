@@ -1,5 +1,9 @@
 import argparse
-import wandb, os
+import os
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from utils.data_manager import DataManager, setup_seed
 from utils.toolkit import count_parameters
 from methods.finetune import Finetune
@@ -8,6 +12,7 @@ from methods.lwf import LwF
 from methods.ewc import EWC
 from methods.target import TARGET
 from methods.lander import LANDER
+from methods.exp5 import Exp5aLocal, Exp5aGlobal
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -15,7 +20,11 @@ warnings.filterwarnings('ignore')
 
 def get_learner(model_name, args):
     name = model_name.lower()
-    if name == "icarl":
+    if name == "exp5a_local":
+        return Exp5aLocal(args)
+    elif name == "exp5a_global":
+        return Exp5aGlobal(args)
+    elif name == "icarl":
         return iCaRL(args)
     elif name == "ewc":
         return EWC(args)
@@ -114,6 +123,15 @@ def args_parser():
                         help='seed for initializing training.') # 0 for train forward, 1 pretrain stage 1, 2 pretrain stage 2
     parser.add_argument('--syn', default=1, type=int,
                         help='seed for initializing training.')  # 0 for train forward, 1 pretrain stage 1, 2 pretrain stage 2
+
+    # Exp5 Trajectory Subspace Replay
+    parser.add_argument('--gdr_task_budget', default=400, type=int, help='replay budget M per task')
+    parser.add_argument('--exp5a_rank', default=128, type=int, help='projection rank r')
+    parser.add_argument('--exp5a_svd_oversampling', default=16, type=int, help='randomized-PCA oversampling p')
+    parser.add_argument('--exp5a_mask_layers', default=12, type=int, help='number of orthogonal mask layers')
+    parser.add_argument('--exp5a_target_mode', default='budget_scaled_sum', type=str, choices=['budget_scaled_sum', 'full_sum'], help='reconstruction target mode')
+    parser.add_argument('--exp5a_tau', default=0.05, type=float, help='attribution invariant tolerance tau')
+
     args = parser.parse_args()
 
     return args
