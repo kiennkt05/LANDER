@@ -1,0 +1,85 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+conda-env/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Experiment tracking & runs
+wandb/
+run/
+runs/
+exps/
+logs/
+*.log
+!forgetting_calculator/log/lander_t10b05.log
+
+# Model checkpoints & weights
+ckpt/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+
+# Federated client/global temporary weight stores
+store/*
+!store/.gitkeep
+
+# Ensure essential paper embedding assets are tracked
+!label_embedding/*.pickle
+
+# Datasets & downloaded data
+datasets/
+data/
+*.tar.gz
+*.zip
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+[Tt]humbs.db
+ehthumbs.db
+[Dd]esktop.ini
