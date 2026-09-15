@@ -197,9 +197,13 @@ class Exp5Base(BaseLearner):
         )
 
         setup_seed(self.seed)
-        user_groups = partition_data(
+        partition_res = partition_data(
             train_dataset.labels, beta=self.args["beta"], n_parties=self.num_users
         )
+        if isinstance(partition_res, tuple):
+            user_groups = partition_res[0]
+        else:
+            user_groups = partition_res
 
         # 2. Dimensions and Candidate Table
         d = self.feature_dim
@@ -216,7 +220,12 @@ class Exp5Base(BaseLearner):
             for l in range(Nk):
                 global_id = cur_offset + l
                 dataset_idx = user_groups[k][l]
-                label = int(train_dataset.labels[dataset_idx])
+                raw_label = train_dataset.labels[dataset_idx]
+                if isinstance(raw_label, (np.ndarray, list)):
+                    arr = np.array(raw_label)
+                    label = int(arr.item()) if arr.size == 1 else int(arr[0])
+                else:
+                    label = int(raw_label)
                 cand_rows.append({
                     "client_id": k,
                     "local_id": l,
