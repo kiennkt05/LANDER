@@ -13,6 +13,7 @@ from methods.ewc import EWC
 from methods.target import TARGET
 from methods.lander import LANDER
 from methods.exp5 import Exp5aLocal, Exp5aGlobal
+from methods.exp6 import Exp6Global
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -24,6 +25,8 @@ def get_learner(model_name, args):
         return Exp5aLocal(args)
     elif name == "exp5a_global":
         return Exp5aGlobal(args)
+    elif name == "exp6_global":
+        return Exp6Global(args)
     elif name == "icarl":
         return iCaRL(args)
     elif name == "ewc":
@@ -129,8 +132,13 @@ def args_parser():
     parser.add_argument('--exp5a_rank', default=128, type=int, help='projection rank r')
     parser.add_argument('--exp5a_svd_oversampling', default=16, type=int, help='randomized-PCA oversampling p')
     parser.add_argument('--exp5a_mask_layers', default=12, type=int, help='number of orthogonal mask layers')
+    parser.add_argument('--exp5a_mask_seed_offset', default=5000, type=int, help='mask seed stride offset across tasks')
     parser.add_argument('--exp5a_target_mode', default='budget_scaled_sum', type=str, choices=['budget_scaled_sum', 'full_sum'], help='reconstruction target mode')
     parser.add_argument('--exp5a_tau', default=0.05, type=float, help='attribution invariant tolerance tau')
+
+    # Exp6 Joint Reconstruction
+    parser.add_argument('--exp6_max_passes', default=5, type=int, help='maximum coordinate passes for Exp6')
+    parser.add_argument('--exp6_improvement_tol', default=1e-8, type=float, help='minimum improvement tolerance for Exp6')
 
     args = parser.parse_args()
 
