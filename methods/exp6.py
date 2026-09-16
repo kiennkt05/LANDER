@@ -63,7 +63,7 @@ def _exp5a_global_projection(
         K = len(vectors)
         client_sizes = [vectors[k].shape[0] for k in range(K)]
         D = vectors[0].shape[1]
-        offsets = [0] + list(np.cumsum(client_sizes[:-1]))
+        offsets = [0] + [int(x) for x in np.cumsum(client_sizes[:-1])]
         N = sum(client_sizes)
         X_mat = torch.cat([vectors[k] for k in range(K)], dim=0)
     else:
@@ -71,8 +71,12 @@ def _exp5a_global_projection(
         N, D = vectors.shape
         if user_groups is not None:
             K = len(user_groups)
-            client_sizes = [len(g) for g in user_groups]
-            offsets = [0] + list(np.cumsum(client_sizes[:-1]))
+            if isinstance(user_groups, dict):
+                client_sizes = [len(user_groups[k]) for k in range(K)]
+            else:
+                client_sizes = [len(g) for g in user_groups]
+            if offsets is None:
+                offsets = [0] + [int(x) for x in np.cumsum(client_sizes[:-1])]
         elif offsets is not None:
             K = len(offsets)
             client_sizes = []
