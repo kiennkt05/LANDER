@@ -13,7 +13,7 @@ from methods.ewc import EWC
 from methods.target import TARGET
 from methods.lander import LANDER
 from methods.exp5 import Exp5aLocal, Exp5aGlobal
-from methods.exp6 import Exp6Global
+from methods.exp6 import Exp6Global, Exp6bGlobal
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -27,6 +27,8 @@ def get_learner(model_name, args):
         return Exp5aGlobal(args)
     elif name == "exp6_global":
         return Exp6Global(args)
+    elif name == "exp6b_global":
+        return Exp6bGlobal(args)
     elif name == "icarl":
         return iCaRL(args)
     elif name == "ewc":
@@ -139,6 +141,11 @@ def args_parser():
     # Exp6 Joint Reconstruction
     parser.add_argument('--exp6_max_passes', default=5, type=int, help='maximum coordinate passes for Exp6')
     parser.add_argument('--exp6_improvement_tol', default=1e-8, type=float, help='minimum improvement tolerance for Exp6')
+
+    # Exp6b Hybrid Global + Local Reconstruction
+    parser.add_argument('--exp6b_lambda', default=1.0, type=float, help='tradeoff lambda between global and local reconstruction in Exp6b (0=Exp6)')
+    parser.add_argument('--exp6b_max_passes', default=5, type=int, help='maximum coordinate passes for Exp6b')
+    parser.add_argument('--exp6b_improvement_tol', default=1e-8, type=float, help='minimum improvement tolerance for Exp6b')
 
     args = parser.parse_args()
 

@@ -314,10 +314,398 @@ def _joint_coordinate_match_on(
     return S, metrics
 
 
+def _build_target_by_client(vectors, quotas, target_mode="budget_scaled_sum"):
+    """Builds the per-client reconstruction targets used by replay selection.
+
+    For the default ``budget_scaled_sum`` target, client k approximates the
+    expected sum of ``B_k`` uniformly sampled trajectories:
+        T_k = (B_k / N_k) * sum_i z_i.
+
+    ``full_sum`` is retained for compatibility with Exp5's target_mode.
+    """
+    target_by_client = {}
+    for k, Z_k in vectors.items():
+        Nk = Z_k.shape[0]
+        Bk = int(quotas[k])
+        if target_mode == "full_sum":
+            T_k = torch.sum(Z_k, dim=0)
+        elif target_mode == "budget_scaled_sum":
+            T_k = (float(Bk) / float(Nk)) * torch.sum(Z_k, dim=0)
+        else:
+            raise ValueError(
+                f"Unsupported target_mode={target_mode!r}; expected "
+                "'budget_scaled_sum' or 'full_sum'."
+            )
+        target_by_client[k] = T_k
+    return target_by_client
+
+
+def _projected_reconstruction_metrics(vectors, selected_rows, target_by_client):
+    """Computes global/local reconstruction and cross-client cancellation diagnostics."""
+    K = len(vectors)
+    G = {}
+    residuals = {}
+    client_rel_sq = {}
+    client_rel = {}
+
+    for k in range(K):
+        T_k = target_by_client[k]
+        rows = selected_rows[k]
+        if len(rows) > 0:
+            G_k = torch.sum(vectors[k][rows], dim=0)
+        else:
+            G_k = torch.zeros_like(T_k)
+        G[k] = G_k
+
+        e_k = T_k - G_k
+        residuals[k] = e_k
+        denom_k = torch.sum(T_k ** 2).item() + 1e-8
+        rel_sq = torch.sum(e_k ** 2).item() / denom_k
+        client_rel_sq[k] = rel_sq
+        client_rel[k] = float(np.sqrt(max(rel_sq, 0.0)))
+
+    T = torch.stack([target_by_client[k] for k in range(K)]).sum(dim=0)
+    global_residual = torch.stack([residuals[k] for k in range(K)]).sum(dim=0)
+    global_rel_sq = torch.sum(global_residual ** 2).item() / (torch.sum(T ** 2).item() + 1e-8)
+
+    mean_client_rel_sq = float(np.mean(list(client_rel_sq.values())))
+    mean_client_rel = float(np.mean(list(client_rel.values())))
+    rms_client_rel = float(np.sqrt(max(mean_client_rel_sq, 0.0)))
+
+    sum_residual_norms = sum(torch.norm(residuals[k]).item() for k in range(K))
+    cancellation_ratio = torch.norm(global_residual).item() / (sum_residual_norms + 1e-8)
+
+    return {
+        "G": G,
+        "residuals": residuals,
+        "target": T,
+        "global_rel_sq": global_rel_sq,
+        "global_recon": float(np.sqrt(max(global_rel_sq, 0.0))),
+        "client_rel_sq": client_rel_sq,
+        "client_recon": client_rel,
+        "mean_client_rel_sq": mean_client_rel_sq,
+        "mean_client_recon": mean_client_rel,
+        "rms_client_recon": rms_client_rel,
+        # 0 => strong residual cancellation; 1 => residuals point in similar directions.
+        "cancellation_ratio": cancellation_ratio,
+    }
+
+
+def _greedy_fixed_quota_hybrid(
+    vectors,
+    global_target_conditioned,
+    local_target,
+    quota,
+    global_denom_sq,
+    local_denom_sq,
+    local_weight,
+):
+    r"""Greedily solves one Exp6b client-coordinate subproblem.
+
+    With all other client selections fixed, selecting client k changes only:
+
+        global term = ||R_global,k - G_k||^2 / ||T||^2
+        local term  = w_local * ||T_k - G_k||^2 / ||T_k||^2
+
+    where ``R_global,k = T - sum_{l != k} G_l`` and
+    ``w_local = lambda_local / K``.
+    """
+    Nk = vectors.shape[0]
+    B = min(int(quota), Nk)
+    available = np.ones(Nk, dtype=bool)
+    norms_sq = torch.sum(vectors ** 2, dim=1)
+    selected_positions = []
+
+    # Residuals after the partial client subset selected so far.
+    global_res = global_target_conditioned.clone()
+    local_res = local_target.clone()
+
+    for _ in range(B):
+        avail_indices = np.where(available)[0]
+        if len(avail_indices) == 0:
+            break
+
+        Z_avail = vectors[avail_indices]
+        norms_avail = norms_sq[avail_indices]
+
+        global_costs = (
+            torch.sum(global_res ** 2)
+            + norms_avail
+            - 2.0 * torch.mv(Z_avail, global_res)
+        ) / global_denom_sq
+
+        local_costs = (
+            torch.sum(local_res ** 2)
+            + norms_avail
+            - 2.0 * torch.mv(Z_avail, local_res)
+        ) / local_denom_sq
+
+        costs = global_costs + float(local_weight) * local_costs
+        best_idx_in_avail = torch.argmin(costs).item()
+        best_j = avail_indices[best_idx_in_avail]
+
+        selected_positions.append(best_j)
+        available[best_j] = False
+        global_res -= vectors[best_j]
+        local_res -= vectors[best_j]
+
+    return selected_positions
+
+
+def _hybrid_coordinate_match_on(
+    vectors,
+    initial_rows,
+    target_by_client=None,
+    quota_per_client=None,
+    lambda_local=1.0,
+    max_passes=5,
+    improvement_tol=1e-8,
+    target_mode="budget_scaled_sum",
+):
+    r"""Exp6b baseline-initialized global+local coordinate optimization.
+
+    Minimizes the normalized hybrid objective
+
+        J_b(S) = ||sum_k e_k||^2 / (||T||^2 + eps)
+                 + lambda_local / K * sum_k ||e_k||^2 / (||T_k||^2 + eps),
+
+    where ``e_k = T_k - sum_{i in S_k} z_i``.
+
+    The first term is Exp6's FedAvg-aware global reconstruction objective.
+    The second term prevents a low global error from being obtained purely by
+    large, mutually-cancelling per-client residuals.
+
+    ``lambda_local=0`` delegates to the original Exp6 optimizer so that the
+    zero-lambda endpoint is an exact implementation-level control (up to the
+    supplied targets/tolerance), rather than merely a similar objective.
+    """
+    if lambda_local < 0:
+        raise ValueError(f"lambda_local must be >= 0, got {lambda_local}")
+
+    K = len(vectors)
+    quotas = {}
+    for k in range(K):
+        if quota_per_client is None:
+            quotas[k] = len(initial_rows[k])
+        elif isinstance(quota_per_client, int):
+            quotas[k] = int(quota_per_client)
+        else:
+            quotas[k] = int(quota_per_client[k])
+
+    if target_by_client is None:
+        target_by_client = _build_target_by_client(
+            vectors=vectors,
+            quotas=quotas,
+            target_mode=target_mode,
+        )
+
+    T = torch.stack([target_by_client[k] for k in range(K)]).sum(dim=0)
+
+    # Exact Exp6 endpoint for lambda=0.
+    if float(lambda_local) == 0.0:
+        S, exp6_metrics = _joint_coordinate_match_on(
+            vectors=vectors,
+            initial_rows=initial_rows,
+            target=T,
+            quota_per_client=quotas,
+            max_passes=max_passes,
+            improvement_tol=improvement_tol,
+        )
+        baseline_metrics = _projected_reconstruction_metrics(
+            vectors, initial_rows, target_by_client
+        )
+        final_metrics = _projected_reconstruction_metrics(
+            vectors, S, target_by_client
+        )
+        return S, {
+            "passes": exp6_metrics["passes"],
+            "initial_objective": baseline_metrics["global_rel_sq"],
+            "final_objective": final_metrics["global_rel_sq"],
+            "relative_objective_improvement": (
+                baseline_metrics["global_rel_sq"] - final_metrics["global_rel_sq"]
+            ) / (baseline_metrics["global_rel_sq"] + 1e-8),
+            "baseline": baseline_metrics,
+            "final": final_metrics,
+            "selection_overlap": exp6_metrics["selection_overlap"],
+            "overlap_count": exp6_metrics["overlap_count"],
+            "overlap_ratio": exp6_metrics["overlap_ratio"],
+            "client_hist": exp6_metrics["client_hist"],
+            "HHI": exp6_metrics["HHI"],
+            "unique": exp6_metrics["unique"],
+            "total_selected": exp6_metrics["total_selected"],
+            "lambda_local": float(lambda_local),
+        }
+
+    # S <- Exp5a-global independent per-client selection.
+    S = {k: list(initial_rows[k]) for k in range(K)}
+    current_metrics = _projected_reconstruction_metrics(vectors, S, target_by_client)
+    baseline_metrics = current_metrics
+    J = (
+        current_metrics["global_rel_sq"]
+        + float(lambda_local) * current_metrics["mean_client_rel_sq"]
+    )
+    initial_J = J
+
+    G = {k: current_metrics["G"][k].clone() for k in range(K)}
+    local_rel_sq = dict(current_metrics["client_rel_sq"])
+    Sigma = torch.stack([G[k] for k in range(K)]).sum(dim=0)
+
+    global_denom_sq = torch.sum(T ** 2).item() + 1e-8
+    local_denom_sq = {
+        k: torch.sum(target_by_client[k] ** 2).item() + 1e-8
+        for k in range(K)
+    }
+    local_weight = float(lambda_local) / float(K)
+
+    passes_completed = 0
+    for _ in range(max_passes):
+        improved = False
+        passes_completed += 1
+
+        for k in range(K):
+            Sigma_not_k = Sigma - G[k]
+            R_global_k = T - Sigma_not_k
+
+            S_prime_k = _greedy_fixed_quota_hybrid(
+                vectors=vectors[k],
+                global_target_conditioned=R_global_k,
+                local_target=target_by_client[k],
+                quota=quotas[k],
+                global_denom_sq=global_denom_sq,
+                local_denom_sq=local_denom_sq[k],
+                local_weight=local_weight,
+            )
+
+            if len(S_prime_k) > 0:
+                G_prime_k = torch.sum(vectors[k][S_prime_k], dim=0)
+            else:
+                G_prime_k = torch.zeros_like(target_by_client[k])
+
+            global_residual_prime = R_global_k - G_prime_k
+            global_rel_sq_prime = (
+                torch.sum(global_residual_prime ** 2).item() / global_denom_sq
+            )
+
+            local_residual_prime = target_by_client[k] - G_prime_k
+            local_rel_sq_prime = (
+                torch.sum(local_residual_prime ** 2).item() / local_denom_sq[k]
+            )
+
+            # Other clients' local reconstruction terms are constant for this coordinate.
+            sum_local_rel_sq_prime = (
+                sum(local_rel_sq.values()) - local_rel_sq[k] + local_rel_sq_prime
+            )
+            J_prime = (
+                global_rel_sq_prime
+                + float(lambda_local) * (sum_local_rel_sq_prime / float(K))
+            )
+
+            if J_prime < J - improvement_tol:
+                S[k] = S_prime_k
+                G[k] = G_prime_k
+                Sigma = Sigma_not_k + G_prime_k
+                local_rel_sq[k] = local_rel_sq_prime
+                J = J_prime
+                improved = True
+
+        if not improved:
+            break
+
+    final_metrics = _projected_reconstruction_metrics(vectors, S, target_by_client)
+    final_J = (
+        final_metrics["global_rel_sq"]
+        + float(lambda_local) * final_metrics["mean_client_rel_sq"]
+    )
+
+    total_overlap = sum(len(set(initial_rows[k]) & set(S[k])) for k in range(K))
+    total_selected = sum(len(S[k]) for k in range(K))
+    overlap_ratio = total_overlap / total_selected if total_selected > 0 else 1.0
+    client_hist = {k: len(S[k]) for k in range(K)}
+    shares = [len(S[k]) / total_selected for k in range(K)] if total_selected > 0 else [0] * K
+    hhi = sum(s ** 2 for s in shares)
+    unique_count = sum(len(set(S[k])) for k in range(K))
+
+    return S, {
+        "passes": passes_completed,
+        "initial_objective": initial_J,
+        "final_objective": final_J,
+        "relative_objective_improvement": (initial_J - final_J) / (initial_J + 1e-8),
+        "baseline": baseline_metrics,
+        "final": final_metrics,
+        "selection_overlap": f"{total_overlap}/{total_selected} ({overlap_ratio:.2%})",
+        "overlap_count": total_overlap,
+        "overlap_ratio": overlap_ratio,
+        "client_hist": client_hist,
+        "HHI": hhi,
+        "unique": unique_count,
+        "total_selected": total_selected,
+        "lambda_local": float(lambda_local),
+    }
+
+
+def _original_space_reconstruction_metrics(
+    trajectory_matrix,
+    selected_rows,
+    user_groups,
+    offsets,
+    target_mode="budget_scaled_sum",
+):
+    """Original-D analogue of Exp6b reconstruction diagnostics."""
+    K = len(user_groups)
+    targets = {}
+    residuals = {}
+    client_rel = {}
+    client_rel_sq = {}
+
+    for k in range(K):
+        Nk = len(user_groups[k])
+        Bk = len(selected_rows[k])
+        start_idx = offsets[k]
+        end_idx = start_idx + Nk
+        V_k = trajectory_matrix[start_idx:end_idx]
+
+        if target_mode == "full_sum":
+            T_k = torch.sum(V_k, dim=0)
+        elif target_mode == "budget_scaled_sum":
+            T_k = (float(Bk) / float(Nk)) * torch.sum(V_k, dim=0)
+        else:
+            raise ValueError(f"Unsupported target_mode={target_mode!r}")
+
+        if Bk > 0:
+            G_k = torch.sum(V_k[selected_rows[k]], dim=0)
+        else:
+            G_k = torch.zeros_like(T_k)
+
+        e_k = T_k - G_k
+        denom_k = torch.sum(T_k ** 2).item() + 1e-8
+        rel_sq = torch.sum(e_k ** 2).item() / denom_k
+
+        targets[k] = T_k
+        residuals[k] = e_k
+        client_rel_sq[k] = rel_sq
+        client_rel[k] = float(np.sqrt(max(rel_sq, 0.0)))
+
+    T = torch.stack([targets[k] for k in range(K)]).sum(dim=0)
+    global_residual = torch.stack([residuals[k] for k in range(K)]).sum(dim=0)
+    global_rel_sq = torch.sum(global_residual ** 2).item() / (torch.sum(T ** 2).item() + 1e-8)
+    mean_client_rel_sq = float(np.mean(list(client_rel_sq.values())))
+
+    sum_residual_norms = sum(torch.norm(residuals[k]).item() for k in range(K))
+    cancellation_ratio = torch.norm(global_residual).item() / (sum_residual_norms + 1e-8)
+
+    return {
+        "global_recon": float(np.sqrt(max(global_rel_sq, 0.0))),
+        "mean_client_recon": float(np.mean(list(client_rel.values()))),
+        "rms_client_recon": float(np.sqrt(max(mean_client_rel_sq, 0.0))),
+        "client_recon": client_rel,
+        "cancellation_ratio": cancellation_ratio,
+    }
+
+
 class Exp6Global(Exp5aGlobal):
     r"""Exp6: Joint FedAvg-Aware Replay Selection via Baseline-Initialized Coordinate Descent.
 
-    Keeps representation and FedCBDR allocation (|S_k| = M/K = 90, no duplicates) identical to Exp5a-global,
+    Keeps representation and FedCBDR allocation (|S_k| = B = M/K, no duplicates) identical to Exp5a-global,
     but replaces independent per-client selection with joint global trajectory reconstruction:
         J(S) = ||T - \sum_k \sum_{i \in S_k} z_i||^2
     initialized from Exp5a-global per-client selection.
@@ -327,6 +715,8 @@ class Exp6Global(Exp5aGlobal):
         self.exp6_max_passes = args.get("exp6_max_passes", 5)
         self.exp6_improvement_tol = args.get("exp6_improvement_tol", 1e-8)
         self.exp5a_mask_seed_offset = args.get("exp5a_mask_seed_offset", 5000)
+        self.exp6_variant_name = "Exp6"
+        self.exp6_selection_label = "Exp6 Joint Replay Selection"
 
     def _compute_projected_trajectories(self, user_groups, offsets, cand_rows):
         Z_dict, diagnostics = _exp5a_global_projection(
@@ -341,7 +731,7 @@ class Exp6Global(Exp5aGlobal):
             mask_seed_offset=self.exp5a_mask_seed_offset,
         )
         rho_global = diagnostics["rho_global"]
-        print(f"[Exp6-Global] Global retained trajectory energy rho_global: {rho_global:.4f}")
+        print(f"[{self.exp6_variant_name}-Global] Global retained trajectory energy rho_global: {rho_global:.4f}")
 
         if self.wandb == 1 and wandb is not None:
             wandb.log({f"Task_{self._cur_task}/global_retained_energy": rho_global})
@@ -512,7 +902,7 @@ unique={metrics['unique']}
 
         # 5. Exp6 Joint Replay Selection
         M = self.gdr_task_budget
-        print(f"Task {self._cur_task}: Performing Exp6 Joint Replay Selection for budget M={M}...")
+        print(f"Task {self._cur_task}: Performing {self.exp6_selection_label} for budget M={M}...")
         selected_by_client = self._construct_exp6_coreset(
             Z_dict=Z_dict,
             user_groups=user_groups,
@@ -527,3 +917,172 @@ unique={metrics['unique']}
         del self.trajectory_matrix
         self.trajectory_matrix = None
         print(f"Task {self._cur_task}: Replay selection completed. Trajectory matrix released.")
+
+
+
+class Exp6bGlobal(Exp6Global):
+    r"""Exp6b: Hybrid Global+Local Trajectory Replay Selection.
+
+    Exp6b keeps Exp6's representation, Exp5a-global initialization, replay
+    budget, hard per-client quotas, and coordinate-descent structure.  The
+    only intended experimental change is the selection objective:
+
+        J_b = E_global^2 + lambda_local * mean_k(E_local,k^2)
+
+    where errors are normalized by their corresponding target norms.
+
+    This directly tests the failure mode exposed by Exp6: a very small global
+    FedAvg reconstruction error can be achieved while individual client
+    reconstructions get worse because their residuals cancel after summation.
+    """
+    def __init__(self, args):
+        super().__init__(args)
+        self.exp6b_lambda = float(args.get("exp6b_lambda", 1.0))
+        self.exp6b_max_passes = int(args.get("exp6b_max_passes", self.exp6_max_passes))
+        self.exp6b_improvement_tol = float(
+            args.get("exp6b_improvement_tol", self.exp6_improvement_tol)
+        )
+        if self.exp6b_lambda < 0:
+            raise ValueError(f"exp6b_lambda must be >= 0, got {self.exp6b_lambda}")
+
+        self.exp6_variant_name = "Exp6b"
+        self.exp6_selection_label = (
+            f"Exp6b Hybrid Global+Local Replay Selection (lambda={self.exp6b_lambda:g})"
+        )
+
+    def _construct_exp6_coreset(self, Z_dict, user_groups, M, cand_rows, offsets, D, train_dataset):
+        K = self.num_users
+        B = M // K
+        assert M % K == 0, f"Replay budget M={M} must be divisible by num_users K={K}"
+
+        # 1. Exact same initialization as Exp5a-global / Exp6.
+        S_initial = self._greedy_selection(Z_dict, user_groups, M)
+        quotas = {k: B for k in range(K)}
+        target_by_client = _build_target_by_client(
+            vectors=Z_dict,
+            quotas=quotas,
+            target_mode=self.target_mode,
+        )
+
+        # 2. Hybrid coordinate optimization. Only the objective differs from Exp6.
+        S_exp6b, metrics = _hybrid_coordinate_match_on(
+            vectors=Z_dict,
+            initial_rows=S_initial,
+            target_by_client=target_by_client,
+            quota_per_client=quotas,
+            lambda_local=self.exp6b_lambda,
+            max_passes=self.exp6b_max_passes,
+            improvement_tol=self.exp6b_improvement_tol,
+            target_mode=self.target_mode,
+        )
+
+        # 3. Verify whether projected-space behavior survives in original D-space.
+        baseline_D = _original_space_reconstruction_metrics(
+            trajectory_matrix=self.trajectory_matrix,
+            selected_rows=S_initial,
+            user_groups=user_groups,
+            offsets=offsets,
+            target_mode=self.target_mode,
+        )
+        final_D = _original_space_reconstruction_metrics(
+            trajectory_matrix=self.trajectory_matrix,
+            selected_rows=S_exp6b,
+            user_groups=user_groups,
+            offsets=offsets,
+            target_mode=self.target_mode,
+        )
+
+        b = metrics["baseline"]
+        f = metrics["final"]
+
+        # 4. Mandatory diagnostic block.  The cancellation ratio is especially
+        # important: lower values mean stronger cross-client residual cancellation.
+        summary_str = f"""
+=================== EXP6B_CORESET_SUMMARY ===================
+task={self._cur_task}
+rank={self.exp5a_rank}
+lambda_local={self.exp6b_lambda:.6g}
+passes={metrics['passes']}
+initial_hybrid_objective={metrics['initial_objective']:.6e}
+final_hybrid_objective={metrics['final_objective']:.6e}
+hybrid_relative_improvement={metrics['relative_objective_improvement']:.4%}
+baseline_global_z_recon={b['global_recon']:.6e}
+final_global_z_recon={f['global_recon']:.6e}
+baseline_mean_client_z_recon={b['mean_client_recon']:.6e}
+final_mean_client_z_recon={f['mean_client_recon']:.6e}
+baseline_rms_client_z_recon={b['rms_client_recon']:.6e}
+final_rms_client_z_recon={f['rms_client_recon']:.6e}
+baseline_z_cancellation_ratio={b['cancellation_ratio']:.6e}
+final_z_cancellation_ratio={f['cancellation_ratio']:.6e}
+baseline_orig_D_global_recon={baseline_D['global_recon']:.6e}
+final_orig_D_global_recon={final_D['global_recon']:.6e}
+baseline_orig_D_mean_client_recon={baseline_D['mean_client_recon']:.6e}
+final_orig_D_mean_client_recon={final_D['mean_client_recon']:.6e}
+baseline_orig_D_cancellation_ratio={baseline_D['cancellation_ratio']:.6e}
+final_orig_D_cancellation_ratio={final_D['cancellation_ratio']:.6e}
+baseline_client_z_recon={{{', '.join(f'{k}: {b["client_recon"][k]:.6e}' for k in range(K))}}}
+final_client_z_recon={{{', '.join(f'{k}: {f["client_recon"][k]:.6e}' for k in range(K))}}}
+selection_overlap={metrics['selection_overlap']}
+client_hist={metrics['client_hist']}
+HHI={metrics['HHI']:.4f}
+unique={metrics['unique']}
+==============================================================
+"""
+        print(summary_str)
+
+        if self.wandb == 1 and wandb is not None:
+            wandb.log({
+                f"Task_{self._cur_task}/exp6b_lambda": self.exp6b_lambda,
+                f"Task_{self._cur_task}/exp6b_initial_objective": metrics["initial_objective"],
+                f"Task_{self._cur_task}/exp6b_final_objective": metrics["final_objective"],
+                f"Task_{self._cur_task}/exp6b_objective_improvement": metrics["relative_objective_improvement"],
+                f"Task_{self._cur_task}/exp6b_baseline_global_z_recon": b["global_recon"],
+                f"Task_{self._cur_task}/exp6b_final_global_z_recon": f["global_recon"],
+                f"Task_{self._cur_task}/exp6b_baseline_mean_client_z_recon": b["mean_client_recon"],
+                f"Task_{self._cur_task}/exp6b_final_mean_client_z_recon": f["mean_client_recon"],
+                f"Task_{self._cur_task}/exp6b_baseline_z_cancellation_ratio": b["cancellation_ratio"],
+                f"Task_{self._cur_task}/exp6b_final_z_cancellation_ratio": f["cancellation_ratio"],
+                f"Task_{self._cur_task}/exp6b_baseline_orig_D_global_recon": baseline_D["global_recon"],
+                f"Task_{self._cur_task}/exp6b_final_orig_D_global_recon": final_D["global_recon"],
+                f"Task_{self._cur_task}/exp6b_baseline_orig_D_mean_client_recon": baseline_D["mean_client_recon"],
+                f"Task_{self._cur_task}/exp6b_final_orig_D_mean_client_recon": final_D["mean_client_recon"],
+                f"Task_{self._cur_task}/exp6b_overlap_ratio": metrics["overlap_ratio"],
+                f"Task_{self._cur_task}/exp6b_passes": metrics["passes"],
+            })
+
+        # 5. Invariants.  For lambda>0, global reconstruction alone is allowed
+        # to trade off against local reconstruction; only the hybrid objective
+        # must be monotone relative to the Exp5a initialization.
+        expected_client_hist = {k: B for k in range(K)}
+        assert metrics["client_hist"] == expected_client_hist, (
+            f"Client quota invariant failed! Expected {expected_client_hist}, "
+            f"got {metrics['client_hist']}"
+        )
+        expected_hhi = 1.0 / float(K)
+        assert abs(metrics["HHI"] - expected_hhi) < 1e-4, (
+            f"HHI invariant failed! Expected {expected_hhi:.4f}, got {metrics['HHI']:.4f}"
+        )
+        assert metrics["unique"] == M, (
+            f"Unique samples invariant failed! Expected {M}, got {metrics['unique']}"
+        )
+        assert metrics["total_selected"] == M, (
+            f"Total samples invariant failed! Expected {M}, got {metrics['total_selected']}"
+        )
+        assert metrics["final_objective"] <= metrics["initial_objective"] + 1e-7, (
+            "Hybrid monotonicity invariant failed! "
+            f"final={metrics['final_objective']:.6e} > "
+            f"initial={metrics['initial_objective']:.6e}"
+        )
+
+        # Strong endpoint check: lambda=0 should preserve Exp6's global monotonicity.
+        if self.exp6b_lambda == 0.0:
+            assert f["global_recon"] <= b["global_recon"] + 1e-7, (
+                "lambda=0 endpoint failed Exp6 global monotonicity: "
+                f"final={f['global_recon']:.6e} > baseline={b['global_recon']:.6e}"
+            )
+
+        # 6. Commit and run the same standard Exp5 evaluation used by Exp6.
+        self._build_replay_from_rows(S_exp6b, user_groups, train_dataset)
+        self._evaluate_selection(S_exp6b, Z_dict, user_groups, offsets, D, cand_rows)
+
+        return S_exp6b
