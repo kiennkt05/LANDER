@@ -135,8 +135,26 @@ class ReplayDataset(Dataset):
     ):
         indices = np.asarray(local_indices, dtype=np.int64)
         self.source_local_indices = indices
-        self.images = dataset.images[indices]
-        self.labels = np.asarray(dataset.labels[indices], dtype=np.int64)
+
+        if hasattr(dataset, "images") and dataset.images is not None:
+            self.images = dataset.images[indices]
+            self.labels = np.asarray(dataset.labels[indices], dtype=np.int64)
+        elif hasattr(dataset, "dataset") and hasattr(dataset, "idxs"):
+            global_indices = np.asarray(dataset.idxs)[indices]
+            base_dataset = dataset.dataset
+            base_images = base_dataset.images
+            if not isinstance(base_images, np.ndarray):
+                base_images = np.asarray(base_images)
+            base_labels = base_dataset.labels
+            if not isinstance(base_labels, np.ndarray):
+                base_labels = np.asarray(base_labels)
+            self.images = base_images[global_indices]
+            self.labels = np.asarray(base_labels[global_indices], dtype=np.int64)
+        else:
+            raise AttributeError(
+                f"Cannot extract images and labels from {type(dataset).__name__}"
+            )
+
         self.transform = transform
         self.use_path = use_path
 

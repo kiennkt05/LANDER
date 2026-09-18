@@ -64,6 +64,24 @@ class DatasetSplit(Dataset):
         idx, image, label = self.dataset[self.idxs[item]]
         return idx, image, label
 
+    @property
+    def images(self):
+        images = getattr(self.dataset, "images", None)
+        if images is not None:
+            if not isinstance(images, np.ndarray):
+                images = np.asarray(images)
+            return images[self.idxs]
+        return None
+
+    @property
+    def labels(self):
+        labels = getattr(self.dataset, "labels", None)
+        if labels is not None:
+            if not isinstance(labels, np.ndarray):
+                labels = np.asarray(labels)
+            return labels[self.idxs]
+        return None
+
 
 def record_net_data_stats(y_train, net_dataidx_map):
     net_cls_counts = {}
