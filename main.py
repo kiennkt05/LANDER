@@ -14,6 +14,7 @@ from methods.target import TARGET
 from methods.lander import LANDER
 from methods.exp5 import Exp5aLocal, Exp5aGlobal
 from methods.exp6 import Exp6Global, Exp6bGlobal
+from methods.fedcbdr import FedCBDR
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -41,6 +42,8 @@ def get_learner(model_name, args):
         return TARGET(args)
     elif name == "lander":
         return LANDER(args)
+    elif name == "fedcbdr":
+        return FedCBDR(args)
     else:
         assert 0
 
@@ -128,6 +131,25 @@ def args_parser():
                         help='seed for initializing training.') # 0 for train forward, 1 pretrain stage 1, 2 pretrain stage 2
     parser.add_argument('--syn', default=1, type=int,
                         help='seed for initializing training.')  # 0 for train forward, 1 pretrain stage 1, 2 pretrain stage 2
+
+    # FedCBDR
+    parser.add_argument('--tau_old', type=float, default=0.9, help='temperature for old classes in TTS')
+    parser.add_argument('--tau_new', type=float, default=1.1, help='temperature for new classes in TTS')
+    parser.add_argument('--w_old', type=float, default=1.1, help='old-class loss weight in TTS')
+    parser.add_argument('--w_new', type=float, default=0.9, help='new-class loss weight in TTS')
+    parser.add_argument('--scale', action='store_true', help='enable FedCBDR scaled evaluation if supported by BaseLearner')
+    parser.add_argument('--mem_size', type=int, default=50, help='legacy FedCBDR memory size; only used with fedcbdr_legacy_mem_size')
+    parser.add_argument('--fedcbdr_legacy_mem_size', action='store_true', help='derive gdr_task_budget from mem_size * increment')
+    parser.add_argument('--gdr_protocol', type=str, default='paper_global', choices=['paper_global', 'repo_local'], help='FedCBDR GDR protocol')
+    parser.add_argument('--gdr_mask_mode', type=str, default='dense_qr', choices=['dense_qr', 'implicit_pairwise'], help='orthogonal masking strategy')
+    parser.add_argument('--gdr_leverage_mode', type=str, default='economy', choices=['full', 'economy', 'truncated'], help='SVD/leverage mode')
+    parser.add_argument('--gdr_rank', type=int, default=None, help='rank used when gdr_leverage_mode=truncated')
+    parser.add_argument('--gdr_normalization_mode', type=str, default='global', choices=['global', 'eq6_local'], help='GDR leverage-score normalization')
+    parser.add_argument('--gdr_replacement', type=str, default='with', choices=['with', 'without'], help='whether replay sampling uses replacement')
+    parser.add_argument('--gdr_correction_mode', type=str, default='none', choices=['none', 'sampling_matrix', 'replay_loss_experimental'], help='GDR sampling correction')
+    parser.add_argument('--tts_mode', type=str, default='paper_eq', choices=['paper_eq', 'repo_dual'], help='task-aware temperature-scaling implementation')
+    parser.add_argument('--joint_loss', type=str, default='tts', choices=['tts'], help='FedCBDR joint-training loss')
+    parser.add_argument('--fedcbdr_lr_schedule', type=str, default='constant', choices=['constant', 'cosine'], help='FedCBDR local learning-rate schedule')
 
     # Exp5 Trajectory Subspace Replay
     parser.add_argument('--gdr_task_budget', default=400, type=int, help='replay budget M per task')
