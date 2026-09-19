@@ -31,11 +31,22 @@ def accuracy(y_pred, y_true, nb_old, increment=10):
         (y_pred == y_true).sum() * 100 / len(y_true), decimals=2
     )
 
-    # Grouped accuracy
-    for class_id in range(0, np.max(y_true), increment):
+    max_y = np.max(y_true)
+
+    for class_id in range(0, max_y, increment):
+        upper = (
+            max_y + 1
+            if class_id + increment >= max_y
+            else class_id + increment
+        )
+
         idxes = np.where(
-            np.logical_and(y_true >= class_id, y_true < class_id + increment)
+            np.logical_and(
+                y_true >= class_id,
+                y_true < upper
+            )
         )[0]
+        
         label = "{}-{}".format(
             str(class_id).rjust(2, "0"), str(class_id + increment - 1).rjust(2, "0")
         )

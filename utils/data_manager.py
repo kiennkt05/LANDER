@@ -136,14 +136,21 @@ class DataManager(object):
         self.args = args
         self.dataset_name = dataset_name
         self._setup_data(dataset_name, shuffle, seed)
-        assert init_cls <= len(self._class_order), "No enough classes."
-        self._increments = [init_cls]
-        while sum(self._increments) + increment < len(self._class_order):
-            self._increments.append(increment)
+        total_cls = len(self._class_order)
+        num_tasks = self.args.get("tasks", None)
+        if num_tasks is not None and num_tasks > 0:
+            self._increments = []
+            for i in range(num_tasks - 1):
+                self._increments.append(increment if i > 0 else init_cls)
+            self._increments.append(total_cls - sum(self._increments))
+        else:
+            self._increments = [init_cls]
+            while sum(self._increments) + increment < total_cls:
+                self._increments.append(increment)
 
-        offset = len(self._class_order) - sum(self._increments)
-        if offset > 0:
-            self._increments.append(offset)
+            offset = total_cls - sum(self._increments)
+            if offset > 0:
+                self._increments.append(offset)
 
     @property
     def nb_tasks(self):

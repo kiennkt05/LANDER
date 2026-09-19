@@ -61,7 +61,7 @@ def train(args):
     )
     args["class_order"] = data_manager.get_class_order()
     learner = get_learner(args["method"], args)
-    cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
+    cnn_curve, nme_curve = {"top1": []}, {"top1": []}
 
     # train for each task
     for task in range(data_manager.nb_tasks):

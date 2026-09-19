@@ -21,7 +21,6 @@ class BaseLearner(object):
         self._network = None
         self._old_network = None
         self._data_memory, self._targets_memory = np.array([]), np.array([])
-        self.topk = 5
         self.args = args
         self.each_task = args["increment"]
         self.seed = args["seed"]
@@ -122,13 +121,10 @@ class BaseLearner(object):
 
     def _evaluate(self, y_pred, y_true):
         ret = {}
-        grouped = accuracy(y_pred.T[0], y_true, self._known_classes, increment=self.each_task)
+        pred_top1 = y_pred if y_pred.ndim == 1 else y_pred.T[0]
+        grouped = accuracy(pred_top1, y_true, self._known_classes, increment=self.each_task)
         ret["grouped"] = grouped
         ret["top1"] = grouped["total"]
-        ret["top{}".format(self.topk)] = np.around(
-            (y_pred.T == np.tile(y_true, (self.topk, 1))).sum() * 100 / len(y_true),
-            decimals=2,
-        )
 
         return ret
 
@@ -176,11 +172,7 @@ class BaseLearner(object):
             inputs = inputs.cuda()
             with torch.no_grad():
                 outputs = self._network(inputs)["logits"]
-            predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+            predicts = torch.max(outputs, dim=1)[1]  # [bs] Top-1 prediction
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
@@ -194,7 +186,7 @@ class BaseLearner(object):
         dists = cdist(class_means, vectors, "sqeuclidean")  # [nb_classes, N]
         scores = dists.T  # [N, nb_classes], choose the one with the smallest distance
 
-        return np.argsort(scores, axis=1)[:, : self.topk], y_true  # [N, topk]
+        return np.argmin(scores, axis=1), y_true  # [N], [N]
 
     def _extract_vectors(self, loader):
         self._network.eval()
