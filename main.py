@@ -179,6 +179,8 @@ if __name__ == '__main__':
     args = args_parser()
     if args.dataset == "tiny_imagenet":
         args.num_class = 200
+    elif args.dataset == "cifar10":
+        args.num_class = 10
     elif args.dataset == "cifar100":
         args.num_class = 100
     elif args.dataset == "imagenet":
