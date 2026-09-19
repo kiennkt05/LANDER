@@ -29,65 +29,6 @@ from utils.inc_net import IncrementalNet
 # Data / transform helpers
 # -----------------------------------------------------------------------------
 
-
-def get_norm_and_transform(dataset):
-    """FedCBDR preprocessing retained from the supplied FedCBDR implementation."""
-    if dataset == "cifar100":
-        data_normalize = dict(
-            mean=(0.5071, 0.4867, 0.4408),
-            std=(0.2675, 0.2565, 0.2761),
-        )
-        train_transform = transforms.Compose(
-            [
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=63 / 255),
-                transforms.ToTensor(),
-                transforms.Normalize(**data_normalize),
-            ]
-        )
-    elif dataset == "tiny_imagenet":
-        data_normalize = dict(
-            mean=(0.4802, 0.4481, 0.3975),
-            std=(0.2302, 0.2265, 0.2262),
-        )
-        train_transform = transforms.Compose(
-            [
-                transforms.RandomCrop(64, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(**data_normalize),
-            ]
-        )
-    else:
-        raise ValueError("FedCBDR has no transform for dataset {!r}".format(dataset))
-
-    normalizer = Normalizer(**data_normalize)
-    return train_transform, normalizer
-
-
-def normalize(tensor, mean, std, reverse=False):
-    if reverse:
-        _mean = [-m / s for m, s in zip(mean, std)]
-        _std = [1 / s for s in std]
-    else:
-        _mean = mean
-        _std = std
-
-    _mean = torch.as_tensor(_mean, dtype=tensor.dtype, device=tensor.device)
-    _std = torch.as_tensor(_std, dtype=tensor.dtype, device=tensor.device)
-    return (tensor - _mean[None, :, None, None]) / _std[None, :, None, None]
-
-
-class Normalizer(object):
-    def __init__(self, mean, std):
-        self.mean = mean
-        self.std = std
-
-    def __call__(self, x, reverse=False):
-        return normalize(x, self.mean, self.std, reverse=reverse)
-
-
 def _label_distribution(labels):
     values = np.asarray(labels, dtype=np.int64)
     if not len(values):
@@ -729,9 +670,6 @@ class FedCBDR(BaseLearner):
         self.train_dataset = None
         self.logger = logging.getLogger(__name__)
 
-        self.transform, self.normalizer = get_norm_and_transform(
-            self.args["dataset"]
-        )
         self._validate_options()
 
     def _validate_options(self):
@@ -1260,8 +1198,8 @@ class FedCBDR(BaseLearner):
             replay = ReplayDataset(
                 local_dataset,
                 [value.local_index for value in values],
-                self.transform,
-                self.args["dataset"] == "tiny_imagenet",
+                self.train_dataset.trsf,
+                self.train_dataset.use_path,
                 weights,
             )
             self.retained_ds_all[client_id].append(replay)
