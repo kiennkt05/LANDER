@@ -117,7 +117,7 @@ def args_parser():
     # Client Training
     parser.add_argument('--num_worker', type=int, default=4, help='number of worker for dataloader')
     parser.add_argument('--mulc', type=str, default="fork", help='type of multi process for dataloader')
-    parser.add_argument('--weight_decay', default=5e-4, type=float, help='weight decay for optimizer')
+    parser.add_argument('--weight_decay', default=1e-5, type=float, help='weight decay for optimizer')
     parser.add_argument('--syn_bs', default=1, type=int, help='number of old synthetic data in training, 1 for similar to local_bs')
     parser.add_argument('--local_lr', default=4e-2, type=float, help='learning rate for optimizer')
 
