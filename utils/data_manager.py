@@ -98,8 +98,9 @@ def record_net_data_stats(y_train, net_dataidx_map):
 
 def partition_data(y_train, beta=0.4, n_parties=5):
     data_size = y_train.shape[0]
+    partition_rng = np.random.RandomState(2023)
     if beta == 0:   # for iid
-        idxs = np.random.permutation(data_size)
+        idxs = partition_rng.permutation(data_size)
         batch_idxs = np.array_split(idxs, n_parties)
         net_dataidx_map = {i: batch_idxs[i] for i in range(n_parties)}
 
@@ -114,8 +115,8 @@ def partition_data(y_train, beta=0.4, n_parties=5):
             idx_batch = [[] for _ in range(n_parties)]
             for k in labels:
                 idx_k = np.where(y_train == k)[0]
-                np.random.shuffle(idx_k)  # shuffle the label
-                proportions = np.random.dirichlet(np.repeat(beta, n_parties))
+                partition_rng.shuffle(idx_k)  # shuffle the label
+                proportions = partition_rng.dirichlet(np.repeat(beta, n_parties))
                 proportions = np.array(   # 0 or x
                     [p * (len(idx_j) < data_size / n_parties) for p, idx_j in zip(proportions, idx_batch)])
                 proportions = proportions / proportions.sum()
@@ -124,7 +125,7 @@ def partition_data(y_train, beta=0.4, n_parties=5):
                 min_size = min([len(idx_j) for idx_j in idx_batch])
 
         for j in range(n_parties):
-            np.random.shuffle(idx_batch[j])
+            partition_rng.shuffle(idx_batch[j])
             net_dataidx_map[j] = idx_batch[j]
     # record_net_data_stats(y_train, net_dataidx_map)
     train_data_cls_counts = record_net_data_stats(y_train, net_dataidx_map)
@@ -291,8 +292,8 @@ class DataManager(object):
         # Order
         order = [i for i in range(len(np.unique(self._train_targets)))]
         if shuffle == 1:
-            np.random.seed(seed)
-            order = np.random.permutation(len(order)).tolist()
+            class_order_rng = np.random.RandomState(2023)
+            order = class_order_rng.permutation(len(order)).tolist()
         else:
             order = idata.get_class_order()
         self._class_order = order
