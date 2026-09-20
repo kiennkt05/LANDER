@@ -269,6 +269,9 @@ class Exp5Base(BaseLearner):
         com_round = self.args["com_round"]
         prog_bar = tqdm(range(com_round), desc=f"Task {self._cur_task} FL Training")
 
+        self.best_model = None  # Best model using the lowest training loss
+        self.lowest_loss = np.inf
+
         local_lr = self.args.get("local_lr", 0.01)
         momentum = 0.9
         weight_decay = self.args.get("weight_decay", 5e-4)
@@ -296,6 +299,7 @@ class Exp5Base(BaseLearner):
             round_delta_wd = torch.zeros(D, dtype=torch.float32)
 
             local_weights = []
+            loss_weight = []
 
             for k in idxs_users:
                 local_model = copy.deepcopy(self._network)
@@ -324,6 +328,7 @@ class Exp5Base(BaseLearner):
                 S = local_ep * num_steps_per_epoch
                 step = 0
 
+                client_loss = 0.0
                 for ep in range(local_ep):
                     for batch_idx, (b_idxs, images, labels, is_cur, cands) in enumerate(local_loader):
                         step += 1
@@ -344,6 +349,8 @@ class Exp5Base(BaseLearner):
                         logits = outputs["logits"]
 
                         loss = F.cross_entropy(logits, labels)
+                        if ep == 0:
+                            client_loss += loss.detach()
 
                         # Exact derivative of optimized scalar loss with respect to logits
                         q = torch.autograd.grad(loss, logits, retain_graph=True)[0]
@@ -389,6 +396,14 @@ class Exp5Base(BaseLearner):
                         optimizer.step()
 
                 local_weights.append(copy.deepcopy(local_model.state_dict()))
+                loss_weight.append(client_loss)
+                del local_loader, local_model
+                torch.cuda.empty_cache()
+
+            sum_loss = sum(loss_weight)  # total loss of previous model
+            if sum_loss < self.lowest_loss:
+                self.lowest_loss = sum_loss
+                self.best_model = copy.deepcopy(self._network.state_dict())
 
             # FedAvg aggregation
             global_weights = average_weights(local_weights)
@@ -433,6 +448,10 @@ class Exp5Base(BaseLearner):
                 "Coreset selection is aborted as mandated by Exp5 specification."
             )
         print("[Attribution Invariant Gate] PASSED successfully.")
+
+        self._network.load_state_dict(self.best_model)  # Best model using the lowest training loss
+        del self.best_model
+        torch.cuda.empty_cache()
 
     def _compute_projected_trajectories(self, user_groups, offsets, cand_rows):
         raise NotImplementedError("Subclasses must implement _compute_projected_trajectories.")

@@ -846,6 +846,8 @@ class FedCBDR(BaseLearner):
 
     def _fl_train(self, train_dataset, test_loader):
         self._network.cuda()
+        self.best_model = None  # Best model using the lowest training loss
+        self.lowest_loss = np.inf
 
         user_groups, _ = partition_data(
             train_dataset.labels,
@@ -902,6 +904,11 @@ class FedCBDR(BaseLearner):
 
                 del local_train_loader, w
                 torch.cuda.empty_cache()
+
+            sum_loss = sum(loss_weight)  # total loss of previous model
+            if sum_loss < self.lowest_loss:
+                self.lowest_loss = sum_loss
+                self.best_model = copy.deepcopy(self._network.state_dict())
 
             global_weights = uniform_average_state_dicts(local_weights)
             self._network.load_state_dict(global_weights)
@@ -960,6 +967,10 @@ class FedCBDR(BaseLearner):
                         )
                     except ImportError:
                         pass
+
+        self._network.load_state_dict(self.best_model)  # Best model using the lowest training loss
+        del self.best_model
+        torch.cuda.empty_cache()
 
         # FedCBDR's next task needs this task's selected replay buffer.
         self._construct_replay_for_current_task()
