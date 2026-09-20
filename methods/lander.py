@@ -750,14 +750,14 @@ class LANDER(BaseLearner):
                 del local_train_loader, w
                 torch.cuda.empty_cache()
             scheduler.step()
-            sum_loss = sum(loss_weight)  # total loss of previous model
-            if sum_loss < self.lowest_loss:
-                self.lowest_loss = sum_loss
-                self.best_model = copy.deepcopy(self._network.state_dict())
-
             # update global weights
             global_weights = average_weights(local_weights)
             self._network.load_state_dict(global_weights)
+
+            sum_loss = sum(loss_weight)
+            if sum_loss < self.lowest_loss:
+                self.lowest_loss = sum_loss
+                self.best_model = copy.deepcopy(self._network.state_dict())
 
             if com % 1 == 0 and com < self.args["com_round"]:
                 test_acc = self._compute_accuracy(self._network, test_loader)

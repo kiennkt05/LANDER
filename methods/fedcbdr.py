@@ -905,13 +905,13 @@ class FedCBDR(BaseLearner):
                 del local_train_loader, w
                 torch.cuda.empty_cache()
 
-            sum_loss = sum(loss_weight)  # total loss of previous model
+            global_weights = uniform_average_state_dicts(local_weights)
+            self._network.load_state_dict(global_weights)
+
+            sum_loss = sum(loss_weight)
             if sum_loss < self.lowest_loss:
                 self.lowest_loss = sum_loss
                 self.best_model = copy.deepcopy(self._network.state_dict())
-
-            global_weights = uniform_average_state_dicts(local_weights)
-            self._network.load_state_dict(global_weights)
 
             if com % 1 == 0 and com < self.args["com_round"]:
                 test_acc = self._compute_fedcbdr_accuracy(

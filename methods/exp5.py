@@ -400,14 +400,14 @@ class Exp5Base(BaseLearner):
                 del local_loader, local_model
                 torch.cuda.empty_cache()
 
-            sum_loss = sum(loss_weight)  # total loss of previous model
-            if sum_loss < self.lowest_loss:
-                self.lowest_loss = sum_loss
-                self.best_model = copy.deepcopy(self._network.state_dict())
-
             # FedAvg aggregation
             global_weights = average_weights(local_weights)
             self._network.load_state_dict(global_weights)
+
+            sum_loss = sum(loss_weight)
+            if sum_loss < self.lowest_loss:
+                self.lowest_loss = sum_loss
+                self.best_model = copy.deepcopy(self._network.state_dict())
 
             # Measure actual FedAvg classifier head delta
             head_after = torch.cat([
