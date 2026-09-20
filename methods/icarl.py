@@ -145,8 +145,7 @@ class iCaRL(BaseLearner):
 
         for _, com in enumerate(prog_bar):
             local_weights = []
-            m = max(int(self.args["frac"] * self.args["num_users"]), 1)
-            idxs_users = np.random.choice(range(self.args["num_users"]), m, replace=False)
+            idxs_users = range(self.args["num_users"])
             for idx in idxs_users:
                 # update local train data
                 if self._cur_task == 0:

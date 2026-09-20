@@ -729,8 +729,7 @@ class LANDER(BaseLearner):
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.args["com_round"], eta_min=1e-3)
         for _, com in enumerate(prog_bar):
             local_weights = []
-            m = max(int(self.args["frac"] * self.args["num_users"]), 1)
-            idxs_users = np.random.choice(range(self.args["num_users"]), m, replace=False)
+            idxs_users = range(self.args["num_users"])
             loss_weight = []
             for idx in idxs_users:
                 local_train_loader = DataLoader(DatasetSplit(train_dataset, user_groups[idx]),

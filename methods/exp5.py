@@ -288,9 +288,8 @@ class Exp5Base(BaseLearner):
             ]).detach().cpu()
 
             # Client selection
-            m = max(int(frac * self.num_users), 1)
-            selected_users = np.random.choice(range(self.num_users), m, replace=False)
-            p_k = 1.0 / len(selected_users)
+            idxs_users = range(self.args["num_users"])
+            p_k = 1.0 / self.args["num_users"]
 
             round_delta_cur = torch.zeros(D, dtype=torch.float32)
             round_delta_rep = torch.zeros(D, dtype=torch.float32)
@@ -298,7 +297,7 @@ class Exp5Base(BaseLearner):
 
             local_weights = []
 
-            for k in selected_users:
+            for k in idxs_users:
                 local_model = copy.deepcopy(self._network)
                 local_model.train()
                 local_model.cuda()

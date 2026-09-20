@@ -213,8 +213,7 @@ class Finetune(BaseLearner):
         prog_bar = tqdm(range(self.args["com_round"]))
         for _, com in enumerate(prog_bar):
             local_weights = []
-            m = max(int(self.args["frac"] * self.args["num_users"]), 1)
-            idxs_users = np.random.choice(range(self.args["num_users"]), m, replace=False)
+            idxs_users = range(self.args["num_users"])
             for idx in idxs_users:
                 local_train_loader = DataLoader(DatasetSplit(train_dataset, user_groups[idx]), 
                     batch_size=self.args["local_bs"], shuffle=True, num_workers=4)
