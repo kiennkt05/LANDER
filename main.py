@@ -152,7 +152,7 @@ def args_parser():
     parser.add_argument('--fedcbdr_lr_schedule', type=str, default='constant', choices=['constant', 'cosine'], help='FedCBDR local learning-rate schedule')
 
     # Exp5 Trajectory Subspace Replay
-    parser.add_argument('--gdr_task_budget', default=400, type=int, help='replay budget M per task')
+    parser.add_argument('--gdr_task_budget', default=None, type=int, help='replay budget M per task')
     parser.add_argument('--exp5a_rank', default=128, type=int, help='projection rank r')
     parser.add_argument('--exp5a_svd_oversampling', default=16, type=int, help='randomized-PCA oversampling p')
     parser.add_argument('--exp5a_mask_layers', default=12, type=int, help='number of orthogonal mask layers')
@@ -185,6 +185,18 @@ if __name__ == '__main__':
         args.num_class = 100
     elif args.dataset == "imagenet":
         args.num_class = 1000
+    else:
+        raise ValueError(f"Unknown dataset '{args.dataset}'.")
+
+    # Match and validate gdr_task_budget based on dataset name and number of tasks
+    budget = {
+        "cifar10": {3: 450, 5: 300},
+        "cifar100": {5: 1000, 10: 500},
+        "tiny_imagenet": {5: 500, 10: 250},
+    }
+    
+    args.gdr_task_budget = budget[args.dataset][args.tasks]
+
     args.init_cls = int(args.num_class / args.tasks)
     args.increment = args.init_cls
 
