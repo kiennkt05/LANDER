@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 import os
 import random
@@ -166,6 +167,12 @@ class Exp5Base(BaseLearner):
         self.exp5a_svd_oversampling = args.get("exp5a_svd_oversampling", 16)
         self.target_mode = args.get("exp5a_target_mode", "budget_scaled_sum")
 
+        # Exp5 greedy-selection diagnostics. Instrumentation only: these values do not
+        # participate in candidate scoring or alter the selected subset.
+        diag_name = f"exp5_greedy_diag_{args.get('exp_name', args.get('method', 'exp5'))}_seed{args.get('seed', 0)}.jsonl"
+        self.exp5_diag_path = os.path.abspath(diag_name)
+        self._exp5_diag_initialized = False
+
         self.num_users = args.get("num_users", 5)
         # Client-retained replay datasets across tasks: dict {client_id: [ReplayDataset_t0, ...]}
         self.retained_ds_all = {k: [] for k in range(self.num_users)}
@@ -251,7 +258,7 @@ class Exp5Base(BaseLearner):
         # 5. Greedy Replay Selection
         M = self.gdr_task_budget
         print(f"Task {self._cur_task}: Performing replay selection for budget M={M} (target_mode={self.target_mode})...")
-        selected_by_client = self._greedy_selection(Z_dict, user_groups, M)
+        selected_by_client = self._greedy_selection(Z_dict, user_groups, M, offsets, cand_rows)
 
         # 6. Evaluate Replay Selection
         self._evaluate_selection(selected_by_client, Z_dict, user_groups, offsets, D, cand_rows)
@@ -271,6 +278,7 @@ class Exp5Base(BaseLearner):
 
         self.best_model = None  # Best model using the lowest training loss
         self.lowest_loss = np.inf
+        best_round = None  # diagnostic only: trajectory still accumulates through all rounds
 
         local_lr = self.args.get("local_lr", 0.01)
         momentum = 0.9
@@ -407,6 +415,7 @@ class Exp5Base(BaseLearner):
             sum_loss = sum(loss_weight)
             if sum_loss < self.lowest_loss:
                 self.lowest_loss = sum_loss
+                best_round = com + 1
                 self.best_model = copy.deepcopy(self._network.state_dict())
 
             # Measure actual FedAvg classifier head delta
@@ -448,6 +457,12 @@ class Exp5Base(BaseLearner):
                 "Coreset selection is aborted as mandated by Exp5 specification."
             )
         print("[Attribution Invariant Gate] PASSED successfully.")
+        loss_value = float(self.lowest_loss.detach().cpu().item()) if torch.is_tensor(self.lowest_loss) else float(self.lowest_loss)
+        print(
+            f"[EXP5_BEST_MODEL_DIAG] task={self._cur_task} best_round={best_round}/{com_round} "
+            f"lowest_loss={loss_value:.8e} trajectory_accumulated_rounds={com_round} "
+            f"rollback={int(best_round is not None and best_round != com_round)}"
+        )
 
         self._network.load_state_dict(self.best_model)  # Best model using the lowest training loss
         del self.best_model
@@ -456,23 +471,65 @@ class Exp5Base(BaseLearner):
     def _compute_projected_trajectories(self, user_groups, offsets, cand_rows):
         raise NotImplementedError("Subclasses must implement _compute_projected_trajectories.")
 
-    def _greedy_selection(self, Z_dict, user_groups, M):
-        """Per-client FedCBDR-style greedy selection on projected trajectory vectors."""
+    def _write_exp5_diag_jsonl(self, records):
+        """Append machine-readable greedy diagnostics without affecting selection."""
+        if not records:
+            return
+        mode = "w" if not self._exp5_diag_initialized else "a"
+        try:
+            with open(self.exp5_diag_path, mode, encoding="utf-8") as f:
+                for rec in records:
+                    f.write(json.dumps(rec, sort_keys=True, allow_nan=False) + "\n")
+            if not self._exp5_diag_initialized:
+                print(f"[EXP5_GREEDY_DIAG_FILE] {self.exp5_diag_path}")
+            self._exp5_diag_initialized = True
+        except Exception as exc:
+            # Diagnostics must never abort or alter the experiment itself.
+            print(f"[EXP5_GREEDY_DIAG_WARNING] Could not write JSONL diagnostics: {exc}")
+
+    @staticmethod
+    def _safe_percentile_leq(pool, value):
+        """Empirical percentile of value in a 1-D tensor: fraction(pool <= value)."""
+        if pool.numel() == 0:
+            return 0.0
+        return torch.mean((pool <= value).float()).item()
+
+    def _greedy_selection(self, Z_dict, user_groups, M, offsets, cand_rows):
+        """
+        Per-client FedCBDR-style greedy selection on projected trajectory vectors,
+        with exhaustive instrumentation of the residual-matching dynamics.
+
+        IMPORTANT: the diagnostics below DO NOT change the original selection rule.
+        At a residual r, the chosen item minimizes ||r-z_j||^2, equivalently maximizes
+
+            Delta_j = ||r||^2 - ||r-z_j||^2
+                    = 2 z_j^T r - ||z_j||^2.
+
+        We log both:
+          (1) marginal residual gain Delta_j -- what the greedy rule truly optimizes, and
+          (2) raw trajectory magnitude ||v_j|| -- how large that sample's accumulated
+              model-update contribution is independent of the current residual.
+        """
         K = self.num_users
         B = M // K
         R = M - K * B
+        eps = 1e-8
 
         selected_by_client = {k: [] for k in range(K)}
         residual_by_client = {}
         target_by_client = {}
+        v_target_by_client = {}
+        v_residual_by_client = {}
+        diag_by_client = {k: [] for k in range(K)}
+        jsonl_records = []
 
-        # 1. Construct reconstruction target and initial residual
+        # 1. Construct reconstruction target and initial residual exactly as before.
         for k in range(K):
             Z_k = Z_dict[k]
             Nk = Z_k.shape[0]
             if self.target_mode == "full_sum":
                 T_k = torch.sum(Z_k, dim=0)
-            else: # budget_scaled_sum
+            else:  # budget_scaled_sum
                 T_k = (float(B) / float(Nk)) * torch.sum(Z_k, dim=0)
             target_by_client[k] = T_k
             residual_by_client[k] = T_k.clone()
@@ -480,12 +537,155 @@ class Exp5Base(BaseLearner):
         available_by_client = {k: np.ones(Z_dict[k].shape[0], dtype=bool) for k in range(K)}
         norms_sq_by_client = {k: torch.sum(Z_dict[k] ** 2, dim=1) for k in range(K)}
 
-        # 2. Hard base quota: B samples per client in round-robin order
+        # Original-space trajectory targets/norms diagnose raw model-update contribution
+        # and whether projected-space greedy choices also improve the true D-space target.
+        v_norms_by_client = {}
+        v_blocks_by_client = {}
+        for k in range(K):
+            Nk = len(user_groups[k])
+            start_idx = offsets[k]
+            V_k = self.trajectory_matrix[start_idx:start_idx + Nk]
+            v_blocks_by_client[k] = V_k
+            v_norms_by_client[k] = torch.linalg.vector_norm(V_k, dim=1)
+            if self.target_mode == "full_sum":
+                T_v = torch.sum(V_k, dim=0)
+            else:
+                T_v = (float(B) / float(Nk)) * torch.sum(V_k, dim=0)
+            v_target_by_client[k] = T_v
+            v_residual_by_client[k] = T_v.clone()
+
+        def record_and_apply(k, best_j, phase):
+            """Record diagnostics for a selected item, then perform the original r <- r-z update."""
+            r_before = residual_by_client[k]
+            T_k = target_by_client[k]
+            z_j = Z_dict[k][best_j]
+
+            target_sq = torch.sum(T_k ** 2).item()
+            denom = target_sq + eps
+            r_before_sq = torch.sum(r_before ** 2).item()
+            z_sq = torch.sum(z_j ** 2).item()
+            dot = torch.dot(z_j, r_before).item()
+            r_after_vec = r_before - z_j
+            r_after_sq = torch.sum(r_after_vec ** 2).item()
+
+            delta_raw = r_before_sq - r_after_sq
+            delta_norm = delta_raw / denom
+            delta_rel_resid = delta_raw / (r_before_sq + eps)
+            resid_before = np.sqrt(max(r_before_sq, 0.0) / denom)
+            resid_after = np.sqrt(max(r_after_sq, 0.0) / denom)
+            resid_sq_before = r_before_sq / denom
+            resid_sq_after = r_after_sq / denom
+            explained_sq_after = 1.0 - resid_sq_after
+
+            z_norm = np.sqrt(max(z_sq, 0.0))
+            target_norm = np.sqrt(max(target_sq, 0.0))
+            r_norm = np.sqrt(max(r_before_sq, 0.0))
+            cosine = dot / (z_norm * r_norm + eps)
+
+            # Apply the SAME selected item to an independently tracked original-D-space
+            # residual. This does not influence selection; it reveals projection mismatch.
+            v_r_before = v_residual_by_client[k]
+            v_T = v_target_by_client[k]
+            v_j_vec = v_blocks_by_client[k][best_j]
+            v_target_sq = torch.sum(v_T ** 2).item()
+            v_denom = v_target_sq + eps
+            v_r_before_sq = torch.sum(v_r_before ** 2).item()
+            v_r_after_vec = v_r_before - v_j_vec
+            v_r_after_sq = torch.sum(v_r_after_vec ** 2).item()
+            v_delta_raw = v_r_before_sq - v_r_after_sq
+            v_delta_norm = v_delta_raw / v_denom
+            v_delta_rel_resid = v_delta_raw / (v_r_before_sq + eps)
+            v_resid_before = np.sqrt(max(v_r_before_sq, 0.0) / v_denom)
+            v_resid_after = np.sqrt(max(v_r_after_sq, 0.0) / v_denom)
+            v_explained_sq_after = 1.0 - (v_r_after_sq / v_denom)
+
+            z_norm_pool = torch.sqrt(torch.clamp(norms_sq_by_client[k], min=0.0))
+            v_norm_pool = v_norms_by_client[k]
+            z_norm_t = torch.tensor(z_norm, dtype=z_norm_pool.dtype)
+            v_norm = v_norm_pool[best_j].item()
+            v_norm_t = torch.tensor(v_norm, dtype=v_norm_pool.dtype)
+            z_pct = self._safe_percentile_leq(z_norm_pool, z_norm_t)
+            v_pct = self._safe_percentile_leq(v_norm_pool, v_norm_t)
+            z_median = torch.median(z_norm_pool).item() if z_norm_pool.numel() else 0.0
+            v_median = torch.median(v_norm_pool).item() if v_norm_pool.numel() else 0.0
+            z_max = torch.max(z_norm_pool).item() if z_norm_pool.numel() else 0.0
+            v_max = torch.max(v_norm_pool).item() if v_norm_pool.numel() else 0.0
+
+            local_rank = len(selected_by_client[k]) + 1
+            global_row = offsets[k] + best_j
+            label = int(cand_rows[global_row]["label"])
+
+            rec = {
+                "type": "step",
+                "task": int(self._cur_task),
+                "client": int(k),
+                "phase": phase,
+                "step": int(local_rank),
+                "budget_client_base": int(B),
+                "local_candidate": int(best_j),
+                "global_candidate": int(global_row),
+                "label": label,
+                "target_norm": float(target_norm),
+                "resid_before": float(resid_before),
+                "resid_after": float(resid_after),
+                "resid_sq_before": float(resid_sq_before),
+                "resid_sq_after": float(resid_sq_after),
+                "explained_sq_after": float(explained_sq_after),
+                "delta_raw": float(delta_raw),
+                "delta_norm": float(delta_norm),
+                "delta_rel_resid": float(delta_rel_resid),
+                "v_resid_before": float(v_resid_before),
+                "v_resid_after": float(v_resid_after),
+                "v_explained_sq_after": float(v_explained_sq_after),
+                "v_delta_raw": float(v_delta_raw),
+                "v_delta_norm": float(v_delta_norm),
+                "v_delta_rel_resid": float(v_delta_rel_resid),
+                "cosine_to_residual": float(cosine),
+                "dot_to_residual_norm": float(dot / denom),
+                "z_norm": float(z_norm),
+                "z_norm_over_target": float(z_norm / (target_norm + eps)),
+                "z_norm_percentile": float(z_pct),
+                "z_norm_over_median": float(z_norm / (z_median + eps)),
+                "z_norm_over_max": float(z_norm / (z_max + eps)),
+                "v_norm": float(v_norm),
+                "v_norm_percentile": float(v_pct),
+                "v_norm_over_median": float(v_norm / (v_median + eps)),
+                "v_norm_over_max": float(v_norm / (v_max + eps)),
+                "negative_gain": bool(delta_norm < -1e-10),
+                "nonpositive_gain": bool(delta_norm <= 0.0),
+                "tiny_gain_1e4": bool(0.0 < delta_norm < 1e-4),
+                "tiny_gain_1e5": bool(0.0 < delta_norm < 1e-5),
+                "v_negative_gain": bool(v_delta_norm < -1e-10),
+                "v_nonpositive_gain": bool(v_delta_norm <= 0.0),
+            }
+            diag_by_client[k].append(rec)
+            jsonl_records.append(rec)
+
+            print(
+                f"[EXP5_GREEDY_STEP] task={self._cur_task} client={k} phase={phase} "
+                f"step={local_rank:03d} cand={best_j} label={label} "
+                f"r={resid_before:.6e}->{resid_after:.6e} "
+                f"delta={delta_norm:+.6e} rel={delta_rel_resid:+.6e} "
+                f"vR={v_resid_before:.6e}->{v_resid_after:.6e} vDelta={v_delta_norm:+.6e} "
+                f"expl={explained_sq_after:+.6e} cos={cosine:+.5f} "
+                f"z/T={z_norm / (target_norm + eps):.6e} zPct={z_pct:.4f} "
+                f"v={v_norm:.6e} vPct={v_pct:.4f} "
+                f"NEG={int(rec['negative_gain'])} vNEG={int(rec['v_negative_gain'])} "
+                f"TINY1e-4={int(rec['tiny_gain_1e4'])}"
+            )
+
+            # Original algorithmic state transition.
+            selected_by_client[k].append(best_j)
+            available_by_client[k][best_j] = False
+            residual_by_client[k] = r_after_vec
+            v_residual_by_client[k] = v_r_after_vec
+
+        # 2. Hard base quota: unchanged selection behavior.
         for step in range(B):
             for k in range(K):
                 r_k = residual_by_client[k]
                 T_k = target_by_client[k]
-                denom = torch.sum(T_k ** 2).item() + 1e-8
+                denom = torch.sum(T_k ** 2).item() + eps
 
                 avail_indices = np.where(available_by_client[k])[0]
                 if len(avail_indices) == 0:
@@ -493,20 +693,15 @@ class Exp5Base(BaseLearner):
 
                 Z_avail = Z_dict[k][avail_indices]
                 norms_avail = norms_sq_by_client[k][avail_indices]
-
-                # ||r_k - z_j||^2 = ||r_k||^2 + ||z_j||^2 - 2 z_j^T r_k
                 r_norm_sq = torch.sum(r_k ** 2)
                 dots = torch.mv(Z_avail, r_k)
                 costs = (r_norm_sq + norms_avail - 2.0 * dots) / denom
 
                 best_idx_in_avail = torch.argmin(costs).item()
                 best_j = avail_indices[best_idx_in_avail]
+                record_and_apply(k, best_j, "base")
 
-                selected_by_client[k].append(best_j)
-                available_by_client[k][best_j] = False
-                residual_by_client[k] -= Z_dict[k][best_j]
-
-        # 3. Remainder slots: R slots globally allocated to cheapest candidate
+        # 3. Remainder slots: unchanged global cheapest-candidate behavior.
         for rem in range(R):
             best_cost = float("inf")
             best_client = None
@@ -515,7 +710,7 @@ class Exp5Base(BaseLearner):
             for k in range(K):
                 r_k = residual_by_client[k]
                 T_k = target_by_client[k]
-                denom = torch.sum(T_k ** 2).item() + 1e-8
+                denom = torch.sum(T_k ** 2).item() + eps
 
                 avail_indices = np.where(available_by_client[k])[0]
                 if len(avail_indices) == 0:
@@ -534,15 +729,190 @@ class Exp5Base(BaseLearner):
                     best_j = avail_indices[min_pos.item()]
 
             if best_client is not None and best_j is not None:
-                selected_by_client[best_client].append(best_j)
-                available_by_client[best_client][best_j] = False
-                residual_by_client[best_client] -= Z_dict[best_client][best_j]
+                record_and_apply(best_client, best_j, "remainder")
 
         total_selected = sum(len(v) for v in selected_by_client.values())
         assert total_selected == M, f"Expected {M} selected samples, but got {total_selected}!"
         for k in range(K):
             assert len(selected_by_client[k]) == len(set(selected_by_client[k])), f"Client {k} has duplicate selections!"
 
+        # 4. Diagnostic summaries. These make saturation visible without parsing every line.
+        all_steps = []
+        for k in range(K):
+            recs = diag_by_client[k]
+            all_steps.extend(recs)
+            deltas = np.asarray([r["delta_norm"] for r in recs], dtype=np.float64)
+            v_pcts = np.asarray([r["v_norm_percentile"] for r in recs], dtype=np.float64)
+            v_deltas = np.asarray([r["v_delta_norm"] for r in recs], dtype=np.float64)
+            positive = np.maximum(deltas, 0.0)
+            negative = np.minimum(deltas, 0.0)
+            positive_total = float(positive.sum())
+            negative_damage = float(-negative.sum())
+            net_gain = float(deltas.sum())
+
+            def checkpoint(step_idx):
+                if not recs:
+                    return float("nan")
+                idx = min(max(step_idx, 1), len(recs)) - 1
+                return recs[idx]["resid_after"]
+
+            def earliest_positive_capture(frac):
+                if positive_total <= 0.0:
+                    return None
+                c = np.cumsum(positive)
+                idx = np.searchsorted(c, frac * positive_total, side="left")
+                return int(min(idx + 1, len(recs)))
+
+            summary = {
+                "type": "client_summary",
+                "task": int(self._cur_task),
+                "client": int(k),
+                "selected": int(len(recs)),
+                "positive_steps": int(np.sum(deltas > 0.0)),
+                "nonpositive_steps": int(np.sum(deltas <= 0.0)),
+                "negative_steps": int(np.sum(deltas < -1e-10)),
+                "tiny_positive_1e4": int(np.sum((deltas > 0.0) & (deltas < 1e-4))),
+                "tiny_positive_1e5": int(np.sum((deltas > 0.0) & (deltas < 1e-5))),
+                "first_nonpositive_step": next((r["step"] for r in recs if r["nonpositive_gain"]), None),
+                "first_negative_step": next((r["step"] for r in recs if r["negative_gain"]), None),
+                "v_nonpositive_steps": int(np.sum(v_deltas <= 0.0)),
+                "v_negative_steps": int(np.sum(v_deltas < -1e-10)),
+                "first_v_nonpositive_step": next((r["step"] for r in recs if r["v_nonpositive_gain"]), None),
+                "first_v_negative_step": next((r["step"] for r in recs if r["v_negative_gain"]), None),
+                "net_gain_norm": net_gain,
+                "positive_gain_total": positive_total,
+                "negative_damage_total": negative_damage,
+                "final_resid": float(recs[-1]["resid_after"]) if recs else None,
+                "final_explained_sq": float(recs[-1]["explained_sq_after"]) if recs else None,
+                "final_v_resid": float(recs[-1]["v_resid_after"]) if recs else None,
+                "final_v_explained_sq": float(recs[-1]["v_explained_sq_after"]) if recs else None,
+                "median_delta_first10": float(np.median(deltas[:10])) if len(deltas) else None,
+                "median_delta_last10": float(np.median(deltas[-10:])) if len(deltas) else None,
+                "late10_over_early10": float(np.median(deltas[-10:]) / (abs(np.median(deltas[:10])) + 1e-12)) if len(deltas) else None,
+                "median_v_percentile_first10": float(np.median(v_pcts[:10])) if len(v_pcts) else None,
+                "median_v_percentile_last10": float(np.median(v_pcts[-10:])) if len(v_pcts) else None,
+                "positive_capture_step_90": earliest_positive_capture(0.90),
+                "positive_capture_step_95": earliest_positive_capture(0.95),
+                "positive_capture_step_99": earliest_positive_capture(0.99),
+                "resid_after_1": checkpoint(1),
+                "resid_after_5": checkpoint(5),
+                "resid_after_10": checkpoint(10),
+                "resid_after_20": checkpoint(20),
+                "resid_after_30": checkpoint(30),
+                "resid_after_45": checkpoint(45),
+                "resid_after_60": checkpoint(60),
+                "resid_after_75": checkpoint(75),
+                "resid_after_90": checkpoint(90),
+            }
+            jsonl_records.append(summary)
+            print(
+                f"[EXP5_GREEDY_CLIENT_SUMMARY] task={self._cur_task} client={k} n={len(recs)} "
+                f"pos={summary['positive_steps']} nonpos={summary['nonpositive_steps']} neg={summary['negative_steps']} "
+                f"tiny1e-4={summary['tiny_positive_1e4']} tiny1e-5={summary['tiny_positive_1e5']} "
+                f"firstNonPos={summary['first_nonpositive_step']} firstNeg={summary['first_negative_step']} "
+                f"vNonPos={summary['v_nonpositive_steps']} vNeg={summary['v_negative_steps']} "
+                f"firstVNonPos={summary['first_v_nonpositive_step']} firstVNeg={summary['first_v_negative_step']} "
+                f"netGain={net_gain:+.6e} negDamage={negative_damage:.6e} "
+                f"finalR={summary['final_resid']:.6e} finalVR={summary['final_v_resid']:.6e} "
+                f"medDeltaFirst10={summary['median_delta_first10']:+.6e} "
+                f"medDeltaLast10={summary['median_delta_last10']:+.6e} "
+                f"late/early={summary['late10_over_early10']:+.6e} "
+                f"cap90={summary['positive_capture_step_90']} cap95={summary['positive_capture_step_95']} cap99={summary['positive_capture_step_99']} "
+                f"medVPctFirst10={summary['median_v_percentile_first10']:.4f} "
+                f"medVPctLast10={summary['median_v_percentile_last10']:.4f}"
+            )
+            print(
+                f"[EXP5_GREEDY_RESID_CHECKPOINTS] task={self._cur_task} client={k} "
+                f"r1={summary['resid_after_1']:.6e} r5={summary['resid_after_5']:.6e} "
+                f"r10={summary['resid_after_10']:.6e} r20={summary['resid_after_20']:.6e} "
+                f"r30={summary['resid_after_30']:.6e} r45={summary['resid_after_45']:.6e} "
+                f"r60={summary['resid_after_60']:.6e} r75={summary['resid_after_75']:.6e} "
+                f"r90={summary['resid_after_90']:.6e}"
+            )
+
+        # Aggregate step-rank bins across clients.
+        max_rank = max((r["step"] for r in all_steps), default=0)
+        requested_bins = [(1, 10), (11, 30), (31, 60), (61, max_rank)]
+        task_bin_records = []
+        for lo, hi in requested_bins:
+            hi = min(hi, max_rank)
+            if lo > hi:
+                continue
+            rows = [r for r in all_steps if lo <= r["step"] <= hi]
+            if not rows:
+                continue
+            d = np.asarray([r["delta_norm"] for r in rows], dtype=np.float64)
+            vp = np.asarray([r["v_norm_percentile"] for r in rows], dtype=np.float64)
+            zp = np.asarray([r["z_norm_percentile"] for r in rows], dtype=np.float64)
+            cs = np.asarray([r["cosine_to_residual"] for r in rows], dtype=np.float64)
+            vd = np.asarray([r["v_delta_norm"] for r in rows], dtype=np.float64)
+            b = {
+                "type": "task_bin",
+                "task": int(self._cur_task),
+                "step_lo": int(lo),
+                "step_hi": int(hi),
+                "count": int(len(rows)),
+                "delta_mean": float(np.mean(d)),
+                "delta_median": float(np.median(d)),
+                "delta_min": float(np.min(d)),
+                "delta_max": float(np.max(d)),
+                "negative_count": int(np.sum(d < -1e-10)),
+                "nonpositive_count": int(np.sum(d <= 0.0)),
+                "v_delta_mean": float(np.mean(vd)),
+                "v_delta_median": float(np.median(vd)),
+                "v_negative_count": int(np.sum(vd < -1e-10)),
+                "v_nonpositive_count": int(np.sum(vd <= 0.0)),
+                "tiny_positive_1e4": int(np.sum((d > 0.0) & (d < 1e-4))),
+                "v_percentile_median": float(np.median(vp)),
+                "z_percentile_median": float(np.median(zp)),
+                "cosine_median": float(np.median(cs)),
+            }
+            task_bin_records.append(b)
+            jsonl_records.append(b)
+            print(
+                f"[EXP5_GREEDY_TASK_BIN] task={self._cur_task} steps={lo:02d}-{hi:02d} n={len(rows)} "
+                f"deltaMean={b['delta_mean']:+.6e} deltaMed={b['delta_median']:+.6e} "
+                f"deltaMin={b['delta_min']:+.6e} deltaMax={b['delta_max']:+.6e} "
+                f"vDeltaMed={b['v_delta_median']:+.6e} "
+                f"nonpos={b['nonpositive_count']} neg={b['negative_count']} "
+                f"vNonpos={b['v_nonpositive_count']} vNeg={b['v_negative_count']} tiny1e-4={b['tiny_positive_1e4']} "
+                f"medVPct={b['v_percentile_median']:.4f} medZPct={b['z_percentile_median']:.4f} "
+                f"medCos={b['cosine_median']:+.5f}"
+            )
+
+        if all_steps:
+            all_d = np.asarray([r["delta_norm"] for r in all_steps], dtype=np.float64)
+            all_vd = np.asarray([r["v_delta_norm"] for r in all_steps], dtype=np.float64)
+            first10 = np.asarray([r["delta_norm"] for r in all_steps if r["step"] <= 10], dtype=np.float64)
+            last10 = np.asarray([r["delta_norm"] for r in all_steps if r["step"] > max_rank - 10], dtype=np.float64)
+            task_summary = {
+                "type": "task_summary",
+                "task": int(self._cur_task),
+                "selected": int(len(all_steps)),
+                "max_rank": int(max_rank),
+                "positive_steps": int(np.sum(all_d > 0.0)),
+                "nonpositive_steps": int(np.sum(all_d <= 0.0)),
+                "negative_steps": int(np.sum(all_d < -1e-10)),
+                "v_nonpositive_steps": int(np.sum(all_vd <= 0.0)),
+                "v_negative_steps": int(np.sum(all_vd < -1e-10)),
+                "tiny_positive_1e4": int(np.sum((all_d > 0.0) & (all_d < 1e-4))),
+                "tiny_positive_1e5": int(np.sum((all_d > 0.0) & (all_d < 1e-5))),
+                "median_delta_first10": float(np.median(first10)) if first10.size else None,
+                "median_delta_last10": float(np.median(last10)) if last10.size else None,
+                "late10_over_early10": float(np.median(last10) / (abs(np.median(first10)) + 1e-12)) if first10.size and last10.size else None,
+            }
+            jsonl_records.append(task_summary)
+            print(
+                f"[EXP5_GREEDY_TASK_SUMMARY] task={self._cur_task} selected={len(all_steps)} "
+                f"pos={task_summary['positive_steps']} nonpos={task_summary['nonpositive_steps']} neg={task_summary['negative_steps']} "
+                f"vNonpos={task_summary['v_nonpositive_steps']} vNeg={task_summary['v_negative_steps']} "
+                f"tiny1e-4={task_summary['tiny_positive_1e4']} tiny1e-5={task_summary['tiny_positive_1e5']} "
+                f"medDeltaFirst10={task_summary['median_delta_first10']:+.6e} "
+                f"medDeltaLast10={task_summary['median_delta_last10']:+.6e} "
+                f"late/early={task_summary['late10_over_early10']:+.6e}"
+            )
+
+        self._write_exp5_diag_jsonl(jsonl_records)
         return selected_by_client
 
     def _evaluate_selection(self, selected_by_client, Z_dict, user_groups, offsets, D, cand_rows):
