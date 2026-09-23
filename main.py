@@ -156,6 +156,10 @@ def args_parser():
     parser.add_argument('--fedcbdr_lr_schedule', type=str, default='constant', choices=['constant', 'cosine'], help='FedCBDR local learning-rate schedule')
 
     # Exp5 Trajectory Subspace Replay
+    exp5_loss = parser.add_mutually_exclusive_group()
+    exp5_loss.add_argument('--repo_dual', action='store_true', help='use FedCBDR repo_dual TTS loss in Exp5 with tau_old/tau_new and w_old/w_new')
+    exp5_loss.add_argument('--exp5_distill_loss', action='store_true', help='use current-sample CE and replay MSE, refreshing all replay logits after each task')
+    exp5_loss.add_argument('--exp5_single_distill_loss', action='store_true', help='use current-sample CE and replay MSE, capturing logits only once from each replay item\'s original task best model')
     parser.add_argument('--gdr_task_budget', default=None, type=int, help='replay budget M per task')
     parser.add_argument('--exp5a_rank', default=128, type=int, help='projection rank r')
     parser.add_argument('--exp5a_svd_oversampling', default=16, type=int, help='randomized-PCA oversampling p')

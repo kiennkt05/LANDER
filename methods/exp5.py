@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from methods.base import BaseLearner
+from methods.fedcbdr import TaskAwareTemperatureScalingLoss
 from utils.inc_net import IncrementalNet
 from utils.data_manager import partition_data, DatasetSplit, average_weights, setup_seed, pil_loader
 
@@ -97,6 +98,7 @@ class ReplayDataset(Dataset):
         self.labels = labels
         self.trsf = trsf
         self.use_path = use_path
+        self.logits = None  # Detached CPU targets from a best task model.
 
     def __len__(self):
         return len(self.images)
@@ -134,6 +136,23 @@ class ClientTaskDataset(Dataset):
     def __len__(self):
         return self.total_len
 
+    def replay_logits(self, indices):
+        """Return padded targets and their class counts in replay batch order."""
+        targets = []
+        for idx in indices.tolist():
+            if idx < self.num_current:
+                continue
+            for ds, offset in zip(self.replay_datasets, self.replay_offsets):
+                if offset <= idx < offset + len(ds):
+                    if ds.logits is None:
+                        raise RuntimeError("Replay distillation targets have not been captured.")
+                    targets.append(ds.logits[idx - offset])
+                    break
+            else:
+                raise IndexError(f"Invalid replay index: {idx}")
+        widths = torch.tensor([target.numel() for target in targets], dtype=torch.long)
+        return torch.nn.utils.rnn.pad_sequence(targets, batch_first=True), widths
+
     def __getitem__(self, idx):
         if idx < self.num_current:
             _, image, label = self.current_dataset[idx]
@@ -166,6 +185,21 @@ class Exp5Base(BaseLearner):
         self.exp5a_rank = args.get("exp5a_rank", 64)
         self.exp5a_svd_oversampling = args.get("exp5a_svd_oversampling", 16)
         self.target_mode = args.get("exp5a_target_mode", "budget_scaled_sum")
+        self.exp5_distill_loss = args.get("exp5_distill_loss", False)
+        self.exp5_single_distill_loss = args.get("exp5_single_distill_loss", False)
+        self.repo_dual = args.get("repo_dual", False)
+        if sum(bool(mode) for mode in (self.exp5_distill_loss, self.exp5_single_distill_loss, self.repo_dual)) > 1:
+            raise ValueError("Choose only one Exp5 loss variant.")
+        self._repo_dual_loss = None
+        if self.repo_dual:
+            self._repo_dual_loss = TaskAwareTemperatureScalingLoss(
+                self._known_classes,
+                args.get("tau_old", 0.9),
+                args.get("tau_new", 1.1),
+                args.get("w_old", 1.1),
+                args.get("w_new", 0.9),
+                mode="repo_dual",
+            )
 
         # Exp5 greedy-selection diagnostics. Instrumentation only: these values do not
         # participate in candidate scoring or alter the selected subset.
@@ -356,7 +390,7 @@ class Exp5Base(BaseLearner):
                         features = outputs["features"]
                         logits = outputs["logits"]
 
-                        loss = F.cross_entropy(logits, labels)
+                        loss = self._training_loss(logits, labels, is_cur, b_idxs, client_ds)
                         if ep == 0:
                             client_loss += loss.detach()
 
@@ -467,6 +501,48 @@ class Exp5Base(BaseLearner):
         self._network.load_state_dict(self.best_model)  # Best model using the lowest training loss
         del self.best_model
         torch.cuda.empty_cache()
+
+    def _training_loss(self, logits, labels, is_cur, batch_indices, client_ds):
+        """Select CE, FedCBDR repo_dual TTS, or current CE plus replay logit MSE."""
+        if self.repo_dual:
+            self._repo_dual_loss.num_old_classes = self._known_classes
+            return self._repo_dual_loss(logits, labels)
+        if not (self.exp5_distill_loss or self.exp5_single_distill_loss):
+            return F.cross_entropy(logits, labels)
+
+        current = is_cur.to(device=logits.device, dtype=torch.bool)
+        loss = logits.sum() * 0.0
+        if current.any():
+            loss = loss + F.cross_entropy(logits[current], labels[current], reduction="sum")
+        if (~current).any():
+            targets, widths = client_ds.replay_logits(batch_indices)
+            targets = targets.to(logits)
+            widths = widths.to(logits.device)
+            # Each item matches only classes seen by its own teacher snapshot.
+            predicted = logits[~current, :targets.shape[1]]
+            valid = torch.arange(targets.shape[1], device=logits.device)[None, :] < widths[:, None]
+            errors = F.mse_loss(predicted, targets, reduction="none").masked_fill(~valid, 0.0)
+            loss = loss + (errors.sum(dim=1) / widths).sum()
+        return loss / logits.shape[0]
+
+    @torch.no_grad()
+    def _refresh_replay_logits(self, datasets=None):
+        """Capture supplied datasets (or all replay) using the restored best model."""
+        if datasets is None:
+            datasets = [ds for client_datasets in self.retained_ds_all.values() for ds in client_datasets]
+        model = self._network
+        was_training = model.training
+        device = next(model.parameters()).device
+        model.eval()
+        try:
+            for ds in datasets:
+                ds.logits = torch.empty((len(ds), self._total_classes), dtype=torch.float32)
+                loader = DataLoader(ds, batch_size=self.args["local_bs"], shuffle=False,
+                                    num_workers=self.args.get("num_worker", 4))
+                for indices, images, _ in loader:
+                    ds.logits[indices] = model(images.to(device))["logits"].detach().float().cpu()
+        finally:
+            model.train(was_training)
 
     def _compute_projected_trajectories(self, user_groups, offsets, cand_rows):
         raise NotImplementedError("Subclasses must implement _compute_projected_trajectories.")
@@ -972,6 +1048,7 @@ class Exp5Base(BaseLearner):
 
     def _commit_replay_memory(self, selected_by_client, user_groups, train_dataset):
         """Converts selected candidate indices into persistent ReplayDataset instances."""
+        new_datasets = []
         for k in range(self.num_users):
             local_ids = sorted(selected_by_client[k])
             dataset_indices = [user_groups[k][l] for l in local_ids]
@@ -982,12 +1059,19 @@ class Exp5Base(BaseLearner):
             replay_ds = ReplayDataset(
                 selected_images,
                 selected_labels,
-                train_dataset.trsf,
+                self.test_loader.dataset.trsf
+                if (self.exp5_distill_loss or self.exp5_single_distill_loss) else train_dataset.trsf,
                 use_path=train_dataset.use_path,
             )
             self.retained_ds_all[k].append(replay_ds)
+            new_datasets.append(replay_ds)
             total_client_replay = sum(len(ds) for ds in self.retained_ds_all[k])
             print(f"Client {k}: Retained {len(local_ids)} new replay samples (cumulative: {total_client_replay}).")
+
+        if self.exp5_distill_loss:
+            self._refresh_replay_logits()
+        elif self.exp5_single_distill_loss:
+            self._refresh_replay_logits(new_datasets)
 
 
 class Exp5aLocal(Exp5Base):
