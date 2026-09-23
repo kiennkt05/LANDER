@@ -167,13 +167,9 @@ class Exp5Base(BaseLearner):
         self.exp5a_svd_oversampling = args.get("exp5a_svd_oversampling", 16)
         self.target_mode = args.get("exp5a_target_mode", "budget_scaled_sum")
 
-        # Exp5-positive ablation: keep only strictly positive marginal residual-gain picks.
-        # IMPORTANT: positivity is defined in the projected z-space actually used by the
-        # greedy selector. The original D-space v-gain remains diagnostic only.
-        self.exp5_positive_only = True
-        self.exp5_positive_gain_tol = 0.0
-
-        diag_name = f"exp5_positive_only_diag_{args.get('exp_name', args.get('method', 'exp5'))}_seed{args.get('seed', 0)}.jsonl"
+        # Exp5 greedy-selection diagnostics. Instrumentation only: these values do not
+        # participate in candidate scoring or alter the selected subset.
+        diag_name = f"exp5_greedy_diag_{args.get('exp_name', args.get('method', 'exp5'))}_seed{args.get('seed', 0)}.jsonl"
         self.exp5_diag_path = os.path.abspath(diag_name)
         self._exp5_diag_initialized = False
 
@@ -500,20 +496,19 @@ class Exp5Base(BaseLearner):
 
     def _greedy_selection(self, Z_dict, user_groups, M, offsets, cand_rows):
         """
-        Strict positive-only greedy selection on projected trajectory vectors.
+        Per-client FedCBDR-style greedy selection on projected trajectory vectors,
+        with exhaustive instrumentation of the residual-matching dynamics.
 
-        This is the Exp5 positive-only ablation. It preserves the original target and
-        candidate objective, but accepts a candidate only when it strictly reduces the
-        current projected residual. If the best available candidate has Delta <= 0,
-        then all remaining candidates are non-improving at that residual, so selection
-        for that client stops and the unused quota is intentionally left empty.
+        IMPORTANT: the diagnostics below DO NOT change the original selection rule.
         At a residual r, the chosen item minimizes ||r-z_j||^2, equivalently maximizes
 
             Delta_j = ||r||^2 - ||r-z_j||^2
                     = 2 z_j^T r - ||z_j||^2.
 
-        Positivity is judged in projected z-space, because that is the actual selection
-        space. We continue to log original D-space v-gain to expose projection mismatch.
+        We log both:
+          (1) marginal residual gain Delta_j -- what the greedy rule truly optimizes, and
+          (2) raw trajectory magnitude ||v_j|| -- how large that sample's accumulated
+              model-update contribution is independent of the current residual.
         """
         K = self.num_users
         B = M // K
@@ -527,8 +522,6 @@ class Exp5Base(BaseLearner):
         v_residual_by_client = {}
         diag_by_client = {k: [] for k in range(K)}
         jsonl_records = []
-        stopped_by_client = {k: False for k in range(K)}
-        stop_record_by_client = {}
 
         # 1. Construct reconstruction target and initial residual exactly as before.
         for k in range(K):
@@ -668,18 +661,6 @@ class Exp5Base(BaseLearner):
             diag_by_client[k].append(rec)
             jsonl_records.append(rec)
 
-            print(
-                f"[EXP5_GREEDY_STEP] task={self._cur_task} client={k} phase={phase} "
-                f"step={local_rank:03d} cand={best_j} label={label} "
-                f"r={resid_before:.6e}->{resid_after:.6e} "
-                f"delta={delta_norm:+.6e} rel={delta_rel_resid:+.6e} "
-                f"vR={v_resid_before:.6e}->{v_resid_after:.6e} vDelta={v_delta_norm:+.6e} "
-                f"expl={explained_sq_after:+.6e} cos={cosine:+.5f} "
-                f"z/T={z_norm / (target_norm + eps):.6e} zPct={z_pct:.4f} "
-                f"v={v_norm:.6e} vPct={v_pct:.4f} "
-                f"NEG={int(rec['negative_gain'])} vNEG={int(rec['v_negative_gain'])} "
-                f"TINY1e-4={int(rec['tiny_gain_1e4'])}"
-            )
 
             # Original algorithmic state transition.
             selected_by_client[k].append(best_j)
@@ -687,102 +668,61 @@ class Exp5Base(BaseLearner):
             residual_by_client[k] = r_after_vec
             v_residual_by_client[k] = v_r_after_vec
 
-        def best_candidate_and_gain(k):
-            """Return (best_j, best_cost, no_op_cost, delta_norm) for current residual."""
-            r_k = residual_by_client[k]
-            T_k = target_by_client[k]
-            denom = torch.sum(T_k ** 2).item() + eps
-            avail_indices = np.where(available_by_client[k])[0]
-            if len(avail_indices) == 0:
-                return None, None, None, None
-
-            Z_avail = Z_dict[k][avail_indices]
-            norms_avail = norms_sq_by_client[k][avail_indices]
-            r_norm_sq = torch.sum(r_k ** 2)
-            dots = torch.mv(Z_avail, r_k)
-            costs = (r_norm_sq + norms_avail - 2.0 * dots) / denom
-            best_pos = torch.argmin(costs).item()
-            best_j = int(avail_indices[best_pos])
-            best_cost = float(costs[best_pos].item())
-            no_op_cost = float((r_norm_sq / denom).item())
-            delta_norm = no_op_cost - best_cost
-            return best_j, best_cost, no_op_cost, delta_norm
-
-        def stop_client(k, reason, best_j=None, best_delta=None, phase="base"):
-            if stopped_by_client[k]:
-                return
-            stopped_by_client[k] = True
-            rec = {
-                "type": "positive_only_stop",
-                "task": int(self._cur_task),
-                "client": int(k),
-                "phase": phase,
-                "selected": int(len(selected_by_client[k])),
-                "quota": int(B),
-                "unused_quota": int(max(B - len(selected_by_client[k]), 0)),
-                "reason": reason,
-                "best_candidate": None if best_j is None else int(best_j),
-                "best_delta_norm": None if best_delta is None else float(best_delta),
-                "positive_gain_tol": float(self.exp5_positive_gain_tol),
-            }
-            stop_record_by_client[k] = rec
-            jsonl_records.append(rec)
-            delta_txt = "None" if best_delta is None else f"{best_delta:+.6e}"
-            print(
-                f"[EXP5_POSITIVE_ONLY_STOP] task={self._cur_task} client={k} phase={phase} "
-                f"selected={len(selected_by_client[k])}/{B} unused={max(B-len(selected_by_client[k]),0)} "
-                f"reason={reason} bestDelta={delta_txt}"
-            )
-
-        # 2. Hard per-client maximum quota B, but DO NOT force-fill it.
-        # If the best remaining candidate is non-positive, every remaining candidate is
-        # non-positive at this residual, so this client's positive-only path terminates.
+        # 2. Hard base quota: unchanged selection behavior.
         for step in range(B):
-            any_active = False
             for k in range(K):
-                if stopped_by_client[k]:
-                    continue
-                any_active = True
-                best_j, best_cost, no_op_cost, best_delta = best_candidate_and_gain(k)
-                if best_j is None:
-                    stop_client(k, "no_candidates", phase="base")
-                    continue
-                if best_delta <= self.exp5_positive_gain_tol:
-                    stop_client(k, "best_gain_nonpositive", best_j, best_delta, "base")
-                    continue
-                record_and_apply(k, best_j, "base_positive_only")
-            if not any_active:
-                break
+                r_k = residual_by_client[k]
+                T_k = target_by_client[k]
+                denom = torch.sum(T_k ** 2).item() + eps
 
-        # 3. Remainder slots, if any: allocate only when the globally best available
-        # candidate still has strictly positive marginal gain. (R=0 in the requested
-        # M=450,K=5 experiments, but keep this correct for general configurations.)
+                avail_indices = np.where(available_by_client[k])[0]
+                if len(avail_indices) == 0:
+                    continue
+
+                Z_avail = Z_dict[k][avail_indices]
+                norms_avail = norms_sq_by_client[k][avail_indices]
+                r_norm_sq = torch.sum(r_k ** 2)
+                dots = torch.mv(Z_avail, r_k)
+                costs = (r_norm_sq + norms_avail - 2.0 * dots) / denom
+
+                best_idx_in_avail = torch.argmin(costs).item()
+                best_j = avail_indices[best_idx_in_avail]
+                record_and_apply(k, best_j, "base")
+
+        # 3. Remainder slots: unchanged global cheapest-candidate behavior.
         for rem in range(R):
-            best = None
+            best_cost = float("inf")
+            best_client = None
+            best_j = None
+
             for k in range(K):
-                # A client that stopped because its best gain was non-positive remains
-                # stopped; without changing its residual no positive candidate can appear.
-                if stopped_by_client[k]:
+                r_k = residual_by_client[k]
+                T_k = target_by_client[k]
+                denom = torch.sum(T_k ** 2).item() + eps
+
+                avail_indices = np.where(available_by_client[k])[0]
+                if len(avail_indices) == 0:
                     continue
-                best_j, best_cost, no_op_cost, best_delta = best_candidate_and_gain(k)
-                if best_j is None or best_delta <= self.exp5_positive_gain_tol:
-                    continue
-                if best is None or best_cost < best[0]:
-                    best = (best_cost, k, best_j, best_delta)
-            if best is None:
-                break
-            _, best_client, best_j, _ = best
-            record_and_apply(best_client, best_j, "remainder_positive_only")
+
+                Z_avail = Z_dict[k][avail_indices]
+                norms_avail = norms_sq_by_client[k][avail_indices]
+                r_norm_sq = torch.sum(r_k ** 2)
+                dots = torch.mv(Z_avail, r_k)
+                costs = (r_norm_sq + norms_avail - 2.0 * dots) / denom
+
+                min_c, min_pos = torch.min(costs, dim=0)
+                if min_c.item() < best_cost:
+                    best_cost = min_c.item()
+                    best_client = k
+                    best_j = avail_indices[min_pos.item()]
+
+            if best_client is not None and best_j is not None:
+                record_and_apply(best_client, best_j, "remainder")
 
         total_selected = sum(len(v) for v in selected_by_client.values())
-        unused = M - total_selected
-        assert total_selected <= M, f"Positive-only selection exceeded budget: {total_selected} > {M}!"
+        assert total_selected == M, f"Expected {M} selected samples, but got {total_selected}!"
         for k in range(K):
             assert len(selected_by_client[k]) == len(set(selected_by_client[k])), f"Client {k} has duplicate selections!"
-        print(
-            f"[EXP5_POSITIVE_ONLY_BUDGET] task={self._cur_task} selected={total_selected}/{M} "
-            f"unused={unused} allocations={[len(selected_by_client[k]) for k in range(K)]}"
-        )
 
         # 4. Diagnostic summaries. These make saturation visible without parsing every line.
         all_steps = []
@@ -816,9 +756,6 @@ class Exp5Base(BaseLearner):
                 "task": int(self._cur_task),
                 "client": int(k),
                 "selected": int(len(recs)),
-                "quota": int(B),
-                "unused_quota": int(max(B - len(recs), 0)),
-                "positive_only": True,
                 "positive_steps": int(np.sum(deltas > 0.0)),
                 "nonpositive_steps": int(np.sum(deltas <= 0.0)),
                 "negative_steps": int(np.sum(deltas < -1e-10)),
@@ -857,7 +794,7 @@ class Exp5Base(BaseLearner):
             }
             jsonl_records.append(summary)
             print(
-                f"[EXP5_GREEDY_CLIENT_SUMMARY] task={self._cur_task} client={k} n={len(recs)}/{B} unused={max(B-len(recs),0)} "
+                f"[EXP5_GREEDY_CLIENT_SUMMARY] task={self._cur_task} client={k} n={len(recs)} "
                 f"pos={summary['positive_steps']} nonpos={summary['nonpositive_steps']} neg={summary['negative_steps']} "
                 f"tiny1e-4={summary['tiny_positive_1e4']} tiny1e-5={summary['tiny_positive_1e5']} "
                 f"firstNonPos={summary['first_nonpositive_step']} firstNeg={summary['first_negative_step']} "
@@ -940,9 +877,6 @@ class Exp5Base(BaseLearner):
                 "type": "task_summary",
                 "task": int(self._cur_task),
                 "selected": int(len(all_steps)),
-                "budget": int(M),
-                "unused_budget": int(M - len(all_steps)),
-                "positive_only": True,
                 "max_rank": int(max_rank),
                 "positive_steps": int(np.sum(all_d > 0.0)),
                 "nonpositive_steps": int(np.sum(all_d <= 0.0)),
@@ -957,7 +891,7 @@ class Exp5Base(BaseLearner):
             }
             jsonl_records.append(task_summary)
             print(
-                f"[EXP5_GREEDY_TASK_SUMMARY] task={self._cur_task} selected={len(all_steps)}/{M} unused={M-len(all_steps)} "
+                f"[EXP5_GREEDY_TASK_SUMMARY] task={self._cur_task} selected={len(all_steps)} "
                 f"pos={task_summary['positive_steps']} nonpos={task_summary['nonpositive_steps']} neg={task_summary['negative_steps']} "
                 f"vNonpos={task_summary['v_nonpositive_steps']} vNeg={task_summary['v_negative_steps']} "
                 f"tiny1e-4={task_summary['tiny_positive_1e4']} tiny1e-5={task_summary['tiny_positive_1e5']} "
@@ -970,25 +904,12 @@ class Exp5Base(BaseLearner):
         return selected_by_client
 
     def _evaluate_selection(self, selected_by_client, Z_dict, user_groups, offsets, D, cand_rows):
-        """Evaluate variable-cardinality positive-only subsets under two targets.
-
-        fixed-budget target: B/N_k * sum_i x_i, where B=M//K=90 here. This is the
-        target actually used during greedy selection, so it is the causal objective.
-
-        actual-count target: B_k/N_k * sum_i x_i. This asks how representative the
-        retained B_k samples are at their realized cardinality and is reported only as
-        a secondary diagnostic.
-        """
         K = self.num_users
-        B = self.gdr_task_budget // K
-        per_client_z_err_fixed = []
-        per_client_z_err_actual = []
-        per_client_v_err_fixed = []
-        per_client_v_err_actual = []
+        per_client_z_err = []
+        per_client_v_err = []
 
         sum_hat_v = torch.zeros(D, dtype=torch.float32)
-        sum_target_v_fixed = torch.zeros(D, dtype=torch.float32)
-        sum_target_v_actual = torch.zeros(D, dtype=torch.float32)
+        sum_target_v = torch.zeros(D, dtype=torch.float32)
 
         client_counts = []
         class_hist = {}
@@ -998,60 +919,44 @@ class Exp5Base(BaseLearner):
             Bk = len(selected_by_client[k])
             client_counts.append(Bk)
 
+            # Projected-space reconstruction
             Z_k = Z_dict[k]
-            if Bk > 0:
-                hat_T_k_z = torch.sum(Z_k[selected_by_client[k]], dim=0)
-            else:
-                hat_T_k_z = torch.zeros(Z_k.shape[1], dtype=Z_k.dtype)
-            T_z_fixed = (float(B) / float(Nk)) * torch.sum(Z_k, dim=0)
-            T_z_actual = (float(Bk) / float(Nk)) * torch.sum(Z_k, dim=0)
-            err_z_fixed = (torch.norm(hat_T_k_z - T_z_fixed) / (torch.norm(T_z_fixed) + 1e-8)).item()
-            err_z_actual = (torch.norm(hat_T_k_z - T_z_actual) / (torch.norm(T_z_actual) + 1e-8)).item() if Bk > 0 else 0.0
-            per_client_z_err_fixed.append(err_z_fixed)
-            per_client_z_err_actual.append(err_z_actual)
+            T_k_z_tilde = (float(Bk) / float(Nk)) * torch.sum(Z_k, dim=0)
+            hat_T_k_z = torch.sum(Z_k[selected_by_client[k]], dim=0)
+            err_z = (torch.norm(hat_T_k_z - T_k_z_tilde) / (torch.norm(T_k_z_tilde) + 1e-8)).item()
+            per_client_z_err.append(err_z)
 
+            # Original D-space reconstruction
             start_idx = offsets[k]
             end_idx = start_idx + Nk
             V_k = self.trajectory_matrix[start_idx:end_idx]
-            if Bk > 0:
-                hat_T_k_v = torch.sum(V_k[selected_by_client[k]], dim=0)
-            else:
-                hat_T_k_v = torch.zeros(D, dtype=V_k.dtype)
-            T_v_fixed = (float(B) / float(Nk)) * torch.sum(V_k, dim=0)
-            T_v_actual = (float(Bk) / float(Nk)) * torch.sum(V_k, dim=0)
-            err_v_fixed = (torch.norm(hat_T_k_v - T_v_fixed) / (torch.norm(T_v_fixed) + 1e-8)).item()
-            err_v_actual = (torch.norm(hat_T_k_v - T_v_actual) / (torch.norm(T_v_actual) + 1e-8)).item() if Bk > 0 else 0.0
-            per_client_v_err_fixed.append(err_v_fixed)
-            per_client_v_err_actual.append(err_v_actual)
+            T_k_v = (float(Bk) / float(Nk)) * torch.sum(V_k, dim=0)
+            hat_T_k_v = torch.sum(V_k[selected_by_client[k]], dim=0)
+            err_v = (torch.norm(hat_T_k_v - T_k_v) / (torch.norm(T_k_v) + 1e-8)).item()
+            per_client_v_err.append(err_v)
 
             sum_hat_v += hat_T_k_v
-            sum_target_v_fixed += T_v_fixed
-            sum_target_v_actual += T_v_actual
+            sum_target_v += T_k_v
 
+            # Record class labels of selected samples
             for j in selected_by_client[k]:
                 lbl = cand_rows[start_idx + j]["label"]
                 class_hist[lbl] = class_hist.get(lbl, 0) + 1
 
-        E_global_v_fixed = (torch.norm(sum_hat_v - sum_target_v_fixed) / (torch.norm(sum_target_v_fixed) + 1e-8)).item()
-        E_global_v_actual = (torch.norm(sum_hat_v - sum_target_v_actual) / (torch.norm(sum_target_v_actual) + 1e-8)).item() if sum(client_counts) > 0 else 0.0
+        E_global_v = (torch.norm(sum_hat_v - sum_target_v) / (torch.norm(sum_target_v) + 1e-8)).item()
+        mean_z_err = float(np.mean(per_client_z_err))
+        mean_v_err = float(np.mean(per_client_v_err))
 
-        total_selected = sum(client_counts)
-        if total_selected > 0:
-            shares = [c / total_selected for c in client_counts]
-            max_share = max(shares)
-            hhi = sum(s ** 2 for s in shares)
-        else:
-            max_share = 0.0
-            hhi = 0.0
+        total_M = sum(client_counts)
+        shares = [c / total_M for c in client_counts]
+        max_share = max(shares)
+        hhi = sum(s ** 2 for s in shares)
 
-        print(f"\n--- Exp5 Positive-Only Replay Evaluation (Task {self._cur_task}) ---")
-        print(f"Client allocations: {client_counts} (Selected {total_selected}/{self.gdr_task_budget}, unused={self.gdr_task_budget-total_selected}, Max share: {max_share:.3f}, HHI: {hhi:.4f})")
-        print(f"Mean client projected z-error [fixed-B target]:   {float(np.mean(per_client_z_err_fixed)):.4e}")
-        print(f"Mean client projected z-error [actual-Bk target]: {float(np.mean(per_client_z_err_actual)):.4e}")
-        print(f"Mean client original v-error  [fixed-B target]:   {float(np.mean(per_client_v_err_fixed)):.4e}")
-        print(f"Mean client original v-error  [actual-Bk target]: {float(np.mean(per_client_v_err_actual)):.4e}")
-        print(f"Global original v-error E_v   [fixed-B target]:   {E_global_v_fixed:.4e}")
-        print(f"Global original v-error E_v   [actual-Bk target]: {E_global_v_actual:.4e}")
+        print(f"\n--- Exp5 Replay Evaluation (Task {self._cur_task}) ---")
+        print(f"Client allocations: {client_counts} (Max share: {max_share:.3f}, HHI: {hhi:.4f})")
+        print(f"Mean client projected z-error: {mean_z_err:.4e}")
+        print(f"Mean client original v-error:  {mean_v_err:.4e}")
+        print(f"Global original v-error E_v:   {E_global_v:.4e}")
         print(f"Class histogram (unique classes={len(class_hist)}): {sorted(class_hist.items())}")
 
         if hasattr(self, "_log_global_z_error"):
@@ -1059,12 +964,8 @@ class Exp5Base(BaseLearner):
 
         if self.wandb == 1 and wandb is not None:
             wandb.log({
-                f"Task_{self._cur_task}/positive_only_selected": total_selected,
-                f"Task_{self._cur_task}/positive_only_unused": self.gdr_task_budget - total_selected,
-                f"Task_{self._cur_task}/mean_z_recon_error_fixedB": float(np.mean(per_client_z_err_fixed)),
-                f"Task_{self._cur_task}/mean_z_recon_error_actualBk": float(np.mean(per_client_z_err_actual)),
-                f"Task_{self._cur_task}/global_v_recon_error_fixedB": E_global_v_fixed,
-                f"Task_{self._cur_task}/global_v_recon_error_actualBk": E_global_v_actual,
+                f"Task_{self._cur_task}/mean_z_recon_error": mean_z_err,
+                f"Task_{self._cur_task}/global_v_recon_error": E_global_v,
                 f"Task_{self._cur_task}/client_hhi": hhi,
                 f"Task_{self._cur_task}/max_client_share": max_share,
             })
@@ -1205,34 +1106,486 @@ class Exp5aGlobal(Exp5Base):
         return Z_dict, R_dict, [rho_global]
 
     def _log_global_z_error(self, selected_by_client, Z_dict, user_groups):
-        """Global z-space errors under fixed-B and actual-Bk targets."""
+        """Global z-space error is geometrically meaningful because all clients share R'_r."""
         K = self.num_users
-        B = self.gdr_task_budget // K
         r_dim = Z_dict[0].shape[1]
         sum_hat_z = torch.zeros(r_dim, dtype=torch.float32)
-        sum_target_z_fixed = torch.zeros(r_dim, dtype=torch.float32)
-        sum_target_z_actual = torch.zeros(r_dim, dtype=torch.float32)
+        sum_target_z = torch.zeros(r_dim, dtype=torch.float32)
 
         for k in range(K):
             Nk = len(user_groups[k])
             Bk = len(selected_by_client[k])
             Z_k = Z_dict[k]
-            T_fixed = (float(B) / float(Nk)) * torch.sum(Z_k, dim=0)
-            T_actual = (float(Bk) / float(Nk)) * torch.sum(Z_k, dim=0)
-            if Bk > 0:
-                hat = torch.sum(Z_k[selected_by_client[k]], dim=0)
-            else:
-                hat = torch.zeros(r_dim, dtype=Z_k.dtype)
-            sum_hat_z += hat
-            sum_target_z_fixed += T_fixed
-            sum_target_z_actual += T_actual
 
-        E_fixed = (torch.norm(sum_hat_z - sum_target_z_fixed) / (torch.norm(sum_target_z_fixed) + 1e-8)).item()
-        E_actual = (torch.norm(sum_hat_z - sum_target_z_actual) / (torch.norm(sum_target_z_actual) + 1e-8)).item() if sum(len(v) for v in selected_by_client.values()) > 0 else 0.0
-        print(f"[Exp5a-Global] Global projected z-error [fixed-B target]:   {E_fixed:.4e}")
-        print(f"[Exp5a-Global] Global projected z-error [actual-Bk target]: {E_actual:.4e}")
+            T_k_z_tilde = (float(Bk) / float(Nk)) * torch.sum(Z_k, dim=0)
+            hat_T_k_z = torch.sum(Z_k[selected_by_client[k]], dim=0)
+
+            sum_hat_z += hat_T_k_z
+            sum_target_z += T_k_z_tilde
+
+        E_global_z = (torch.norm(sum_hat_z - sum_target_z) / (torch.norm(sum_target_z) + 1e-8)).item()
+        print(f"[Exp5a-Global] Global projected z-error E_global_z: {E_global_z:.4e}")
         if self.wandb == 1 and wandb is not None:
-            wandb.log({
-                f"Task_{self._cur_task}/global_z_recon_error_fixedB": E_fixed,
-                f"Task_{self._cur_task}/global_z_recon_error_actualBk": E_actual,
-            })
+            wandb.log({f"Task_{self._cur_task}/global_z_recon_error": E_global_z})
+
+class Exp5bTopK(Exp5aGlobal):
+    """
+    Exp5b-TopK:
+    Same trajectory construction and global projected subspace as Exp5aGlobal.
+
+    Selection ablation:
+      1. For each client, construct the same budget-scaled target T_k.
+      2. Score every candidate ONCE against the initial target:
+
+             gain_j = ||T_k||^2 - ||T_k - z_j||^2
+                    = 2 z_j^T T_k - ||z_j||^2
+
+      3. Keep only candidates with strictly positive gain.
+      4. Rank them by gain descending.
+      5. Select the highest-positive items.
+
+    Unlike Exp5aGlobal, the residual is NOT updated after each selection.
+    Therefore this isolates the ranking quality from iterative residual matching.
+
+    The nominal task budget M is preserved as an upper bound. If fewer than M
+    positive candidates exist, the unused budget is intentionally left empty.
+    """
+
+    def __init__(self, args):
+        super().__init__(args)
+
+    def _greedy_selection(self, Z_dict, user_groups, M, offsets, cand_rows):
+        K = self.num_users
+
+        # Same base/remainder budget convention as Exp5aGlobal.
+        B = M // K
+        R = M - K * B
+
+        selected_by_client = {k: [] for k in range(K)}
+        ranked_by_client = {}
+        jsonl_records = []
+
+        # -------------------------------------------------------------
+        # 1. Compute one-shot positive-gain ranking independently
+        #    inside every client.
+        # -------------------------------------------------------------
+        for k in range(K):
+            Z_k = Z_dict[k]
+            Nk = Z_k.shape[0]
+
+            if Nk == 0:
+                ranked_by_client[k] = []
+                continue
+
+            # Same target definition used by Exp5aGlobal.
+            if self.target_mode == "full_sum":
+                T_k = torch.sum(Z_k, dim=0)
+            else:
+                T_k = (float(B) / float(Nk)) * torch.sum(Z_k, dim=0)
+
+            # Initial marginal gain:
+            #
+            #   ||T||^2 - ||T-z_j||^2
+            # = 2 z_j^T T - ||z_j||^2
+            #
+            z_norm_sq = torch.sum(Z_k ** 2, dim=1)
+            dots = torch.mv(Z_k, T_k)
+            gains = 2.0 * dots - z_norm_sq
+
+            # Strict positive-only filtering.
+            positive_idx = torch.nonzero(
+                gains > 0.0, as_tuple=False
+            ).flatten()
+
+            if positive_idx.numel() == 0:
+                ranked_by_client[k] = []
+                print(
+                    f"[EXP5B_TOPK_RANKING] task={self._cur_task} "
+                    f"client={k} candidates={Nk} positive=0"
+                )
+                continue
+
+            positive_gains = gains[positive_idx]
+
+            # Highest positive gain first.
+            order = torch.argsort(
+                positive_gains,
+                descending=True,
+            )
+
+            ranked_idx = positive_idx[order].cpu().tolist()
+            ranked_by_client[k] = ranked_idx
+
+            sorted_gains = positive_gains[order]
+
+            print(
+                f"[EXP5B_TOPK_RANKING] task={self._cur_task} "
+                f"client={k} candidates={Nk} "
+                f"positive={len(ranked_idx)} "
+                f"best_gain={sorted_gains[0].item():+.6e} "
+                f"worst_positive_gain={sorted_gains[-1].item():+.6e}"
+            )
+
+        # -------------------------------------------------------------
+        # 2. Give every client its normal base quota B.
+        # -------------------------------------------------------------
+        for k in range(K):
+            take = min(B, len(ranked_by_client[k]))
+            selected_by_client[k] = ranked_by_client[k][:take]
+
+        # -------------------------------------------------------------
+        # 3. Allocate the R ordinary remainder slots globally according
+        #    to the next-highest positive gain.
+        #
+        #    In addition, if some client cannot fill B because it has
+        #    too few positive candidates, those unused slots are also
+        #    allowed to move globally. This keeps M as the task-level
+        #    upper bound while never admitting a non-positive item.
+        # -------------------------------------------------------------
+        used = sum(len(v) for v in selected_by_client.values())
+        remaining_slots = M - used
+
+        if remaining_slots > 0:
+            global_remaining = []
+
+            for k in range(K):
+                Z_k = Z_dict[k]
+                Nk = Z_k.shape[0]
+
+                if Nk == 0:
+                    continue
+
+                if self.target_mode == "full_sum":
+                    T_k = torch.sum(Z_k, dim=0)
+                else:
+                    T_k = (float(B) / float(Nk)) * torch.sum(Z_k, dim=0)
+
+                z_norm_sq = torch.sum(Z_k ** 2, dim=1)
+                gains = 2.0 * torch.mv(Z_k, T_k) - z_norm_sq
+
+                already = set(selected_by_client[k])
+
+                for j in ranked_by_client[k]:
+                    if j not in already:
+                        global_remaining.append(
+                            (float(gains[j].item()), k, j)
+                        )
+
+            global_remaining.sort(key=lambda x: x[0], reverse=True)
+
+            for gain, k, j in global_remaining[:remaining_slots]:
+                selected_by_client[k].append(j)
+
+        # -------------------------------------------------------------
+        # 4. Diagnostics.
+        # -------------------------------------------------------------
+        total_selected = sum(
+            len(v) for v in selected_by_client.values()
+        )
+
+        client_counts = [
+            len(selected_by_client[k]) for k in range(K)
+        ]
+
+        print(
+            f"[EXP5B_TOPK_SUMMARY] task={self._cur_task} "
+            f"budget={M} selected={total_selected} "
+            f"unused={M - total_selected} "
+            f"allocations={client_counts}"
+        )
+
+        for k in range(K):
+            Z_k = Z_dict[k]
+            Nk = Z_k.shape[0]
+
+            if Nk == 0:
+                continue
+
+            if self.target_mode == "full_sum":
+                T_k = torch.sum(Z_k, dim=0)
+            else:
+                T_k = (float(B) / float(Nk)) * torch.sum(Z_k, dim=0)
+
+            z_norm_sq = torch.sum(Z_k ** 2, dim=1)
+            gains = 2.0 * torch.mv(Z_k, T_k) - z_norm_sq
+
+            for rank, j in enumerate(selected_by_client[k], start=1):
+                global_row = offsets[k] + j
+
+                rec = {
+                    "type": "exp5b_topk_step",
+                    "task": int(self._cur_task),
+                    "client": int(k),
+                    "rank": int(rank),
+                    "local_candidate": int(j),
+                    "global_candidate": int(global_row),
+                    "label": int(cand_rows[global_row]["label"]),
+                    "initial_gain_raw": float(gains[j].item()),
+                    "positive_gain": bool(gains[j].item() > 0.0),
+                }
+                jsonl_records.append(rec)
+
+            assert (
+                len(selected_by_client[k])
+                == len(set(selected_by_client[k]))
+            ), f"Client {k} has duplicate selections!"
+
+        jsonl_records.append({
+            "type": "exp5b_topk_task_summary",
+            "task": int(self._cur_task),
+            "budget": int(M),
+            "selected": int(total_selected),
+            "unused_budget": int(M - total_selected),
+            "client_allocations": client_counts,
+        })
+
+        self._write_exp5_diag_jsonl(jsonl_records)
+
+        return selected_by_client
+
+
+class Exp5bFedCBDR(Exp5aGlobal):
+    """
+    Exp5b-FedCBDR:
+    Same trajectory matrix and Exp5aGlobal projected representation Z_k,
+    but replace residual matching by FedCBDR's leverage-score mechanism.
+
+    For each client:
+        Z_k = U_k S_k V_k^T
+        tau_j = ||U_k[j, :]||_2^2
+        tau <- tau / sum(tau)
+
+    Following FedCBDR:
+      - each client receives floor(M/K) draws;
+      - leverage scores determine sampling probability;
+      - sampling uses torch.multinomial(..., replacement=True).
+
+    NOTE:
+    ReplayDataset ultimately represents retained dataset items rather than
+    repeated sampling weights. Therefore duplicate FedCBDR draws are
+    collapsed to unique local sample indices before memory is committed.
+    """
+
+    def __init__(self, args):
+        super().__init__(args)
+
+    @staticmethod
+    def _fedcbdr_leverage_scores(Z_k):
+        """
+        FedCBDR-style row leverage scores:
+
+            tau_j = ||e_j^T U||_2^2
+
+        where U comes from the SVD of the client matrix.
+        """
+        Nk = Z_k.shape[0]
+
+        if Nk == 0:
+            return torch.empty(0, dtype=torch.float32)
+
+        # torch.linalg.svd is the modern equivalent of the torch.svd
+        # operation used in the released FedCBDR implementation.
+        U, _, _ = torch.linalg.svd(
+            Z_k,
+            full_matrices=False,
+        )
+
+        tau = torch.sum(U ** 2, dim=1)
+
+        tau_sum = tau.sum()
+        if tau_sum <= 0.0 or not torch.isfinite(tau_sum):
+            # Defensive fallback only for a degenerate matrix.
+            tau = torch.ones(
+                Nk,
+                dtype=Z_k.dtype,
+                device=Z_k.device,
+            )
+            tau_sum = tau.sum()
+
+        tau = tau / tau_sum
+        return tau
+
+    def _greedy_selection(self, Z_dict, user_groups, M, offsets, cand_rows):
+        K = self.num_users
+        B = M // K
+        R = M - K * B
+
+        selected_by_client = {k: [] for k in range(K)}
+        leverage_by_client = {}
+        jsonl_records = []
+
+        # -------------------------------------------------------------
+        # 1. FedCBDR local leverage scores.
+        # -------------------------------------------------------------
+        for k in range(K):
+            tau_k = self._fedcbdr_leverage_scores(Z_dict[k])
+            leverage_by_client[k] = tau_k
+
+            if tau_k.numel() > 0:
+                print(
+                    f"[EXP5B_FEDCBDR_LEVERAGE] "
+                    f"task={self._cur_task} client={k} "
+                    f"N={tau_k.numel()} "
+                    f"sum={tau_k.sum().item():.6f} "
+                    f"min={tau_k.min().item():.6e} "
+                    f"max={tau_k.max().item():.6e}"
+                )
+
+        # -------------------------------------------------------------
+        # 2. Construct FedCBDR global probability.
+        #
+        # FedCBDR multiplies each client's internally normalized tau by
+        # 1/K, concatenates them, and normalizes globally.
+        # -------------------------------------------------------------
+        global_parts = []
+
+        for k in range(K):
+            tau_k = leverage_by_client[k]
+            if tau_k.numel() > 0:
+                global_parts.append(tau_k / float(K))
+            else:
+                global_parts.append(tau_k)
+
+        p_global = torch.cat(global_parts)
+
+        p_sum = p_global.sum()
+        if p_sum <= 0.0 or not torch.isfinite(p_sum):
+            raise RuntimeError(
+                "Exp5bFedCBDR obtained invalid global leverage probabilities."
+            )
+
+        p_global = p_global / p_sum
+
+        # -------------------------------------------------------------
+        # 3. FedCBDR base sampling:
+        #
+        #       B = floor(M / K)
+        #
+        # draws PER CLIENT, WITH replacement.
+        # -------------------------------------------------------------
+        sampled_draws_by_client = {k: [] for k in range(K)}
+
+        for k in range(K):
+            tau_k = leverage_by_client[k]
+            Nk = tau_k.numel()
+
+            if Nk == 0 or B == 0:
+                continue
+
+            # FedCBDR uses the client's slice of the globally aggregated
+            # probability vector directly. torch.multinomial accepts
+            # unnormalized non-negative weights.
+            draws = torch.multinomial(
+                tau_k,
+                B,
+                replacement=True,
+            )
+
+            sampled_draws_by_client[k].extend(
+                draws.cpu().tolist()
+            )
+
+        # -------------------------------------------------------------
+        # 4. FedCBDR remainder sampling globally.
+        # -------------------------------------------------------------
+        if R > 0:
+            extra = torch.multinomial(
+                p_global,
+                R,
+                replacement=True,
+            ).cpu().tolist()
+
+            sizes = [Z_dict[k].shape[0] for k in range(K)]
+            boundaries = np.cumsum([0] + sizes)
+
+            for global_idx in extra:
+                for k in range(K):
+                    if (
+                        boundaries[k]
+                        <= global_idx
+                        < boundaries[k + 1]
+                    ):
+                        local_j = global_idx - boundaries[k]
+                        sampled_draws_by_client[k].append(
+                            int(local_j)
+                        )
+                        break
+
+        # -------------------------------------------------------------
+        # 5. Convert draws to retained dataset items.
+        #
+        # FedCBDR samples with replacement, so duplicate draws are
+        # possible. Exp5 replay memory stores dataset items, therefore
+        # collapse duplicates while preserving first-draw order.
+        # -------------------------------------------------------------
+        total_draws = 0
+        total_unique = 0
+
+        for k in range(K):
+            draws = sampled_draws_by_client[k]
+            total_draws += len(draws)
+
+            seen = set()
+            unique = []
+
+            for j in draws:
+                if j not in seen:
+                    seen.add(j)
+                    unique.append(j)
+
+            selected_by_client[k] = unique
+            total_unique += len(unique)
+
+            duplicate_count = len(draws) - len(unique)
+
+            print(
+                f"[EXP5B_FEDCBDR_CLIENT] "
+                f"task={self._cur_task} client={k} "
+                f"draws={len(draws)} unique={len(unique)} "
+                f"duplicates={duplicate_count}"
+            )
+
+            tau_k = leverage_by_client[k]
+
+            for draw_rank, j in enumerate(draws, start=1):
+                global_row = offsets[k] + j
+
+                jsonl_records.append({
+                    "type": "exp5b_fedcbdr_draw",
+                    "task": int(self._cur_task),
+                    "client": int(k),
+                    "draw": int(draw_rank),
+                    "local_candidate": int(j),
+                    "global_candidate": int(global_row),
+                    "label": int(cand_rows[global_row]["label"]),
+                    "leverage_score": float(tau_k[j].item()),
+                })
+
+        assert total_draws == M, (
+            f"Expected {M} FedCBDR draws, got {total_draws}."
+        )
+
+        print(
+            f"[EXP5B_FEDCBDR_SUMMARY] "
+            f"task={self._cur_task} budget={M} "
+            f"draws={total_draws} unique_retained={total_unique} "
+            f"duplicate_draws={total_draws - total_unique} "
+            f"allocations="
+            f"{[len(selected_by_client[k]) for k in range(K)]}"
+        )
+
+        jsonl_records.append({
+            "type": "exp5b_fedcbdr_task_summary",
+            "task": int(self._cur_task),
+            "budget": int(M),
+            "draws": int(total_draws),
+            "unique_retained": int(total_unique),
+            "duplicate_draws": int(total_draws - total_unique),
+            "client_allocations": [
+                len(selected_by_client[k]) for k in range(K)
+            ],
+        })
+
+        self._write_exp5_diag_jsonl(jsonl_records)
+
+        return selected_by_client

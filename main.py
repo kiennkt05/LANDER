@@ -12,7 +12,7 @@ from methods.lwf import LwF
 from methods.ewc import EWC
 from methods.target import TARGET
 from methods.lander import LANDER
-from methods.exp5 import Exp5aLocal, Exp5aGlobal
+from methods.exp5 import Exp5aLocal, Exp5aGlobal, Exp5bTopK, Exp5bFedCBDR
 from methods.exp6 import Exp6Global, Exp6bGlobal
 from methods.fedcbdr import FedCBDR
 import warnings
@@ -26,6 +26,10 @@ def get_learner(model_name, args):
         return Exp5aLocal(args)
     elif name == "exp5a_global":
         return Exp5aGlobal(args)
+    elif name == "exp5b_topk":
+        return Exp5bTopK(args)
+    elif name == "exp5b_fedcbdr":
+        return Exp5bFedCBDR(args)
     elif name == "exp6_global":
         return Exp6Global(args)
     elif name == "exp6b_global":
