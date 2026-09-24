@@ -503,7 +503,7 @@ class Exp5Base(BaseLearner):
         torch.cuda.empty_cache()
 
     def _training_loss(self, logits, labels, is_cur, batch_indices, client_ds):
-        """Select CE, FedCBDR repo_dual TTS, or current CE plus replay logit MSE."""
+        """Select CE, FedCBDR repo_dual TTS, or all-sample CE plus replay logit MSE."""
         if self.repo_dual:
             self._repo_dual_loss.num_old_classes = self._known_classes
             return self._repo_dual_loss(logits, labels)
@@ -511,9 +511,7 @@ class Exp5Base(BaseLearner):
             return F.cross_entropy(logits, labels)
 
         current = is_cur.to(device=logits.device, dtype=torch.bool)
-        loss = logits.sum() * 0.0
-        if current.any():
-            loss = loss + F.cross_entropy(logits[current], labels[current], reduction="sum")
+        loss = F.cross_entropy(logits, labels, reduction="sum")
         if (~current).any():
             targets, widths = client_ds.replay_logits(batch_indices)
             targets = targets.to(logits)
