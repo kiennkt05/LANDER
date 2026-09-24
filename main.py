@@ -156,6 +156,7 @@ def args_parser():
     parser.add_argument('--fedcbdr_lr_schedule', type=str, default='constant', choices=['constant', 'cosine'], help='FedCBDR local learning-rate schedule')
 
     # Exp5 Trajectory Subspace Replay
+    parser.add_argument('--repeat_rate', default=1, type=int, help='number of appearances per retained replay item in each Exp5 local epoch (positive integer; current items appear once)')
     exp5_loss = parser.add_mutually_exclusive_group()
     exp5_loss.add_argument('--repo_dual', action='store_true', help='use FedCBDR repo_dual TTS loss in Exp5 with tau_old/tau_new and w_old/w_new')
     exp5_loss.add_argument('--exp5_distill_loss', action='store_true', help='use current-sample CE and replay MSE, refreshing all replay logits after each task')
@@ -178,6 +179,8 @@ def args_parser():
     parser.add_argument('--exp6b_improvement_tol', default=1e-8, type=float, help='minimum improvement tolerance for Exp6b')
 
     args = parser.parse_args()
+    if args.repeat_rate < 1:
+        parser.error('--repeat_rate must be a positive integer')
 
     return args
 

@@ -1,6 +1,7 @@
 import copy
 import json
 import logging
+from numbers import Integral
 import os
 import random
 import numpy as np
@@ -115,12 +116,18 @@ class ReplayDataset(Dataset):
 class ClientTaskDataset(Dataset):
     """Combines a client's current-task data with all previously retained replay datasets.
 
+    Current items appear once; replay items have `repeat_rate` virtual copies.
+    Images and cached logits remain stored only in the original replay datasets.
+
     Returns:
         (idx, image, label, is_current, candidate_id)
         where `is_current` is True only for current-task samples, and `candidate_id` is the
         row index in the current task trajectory matrix V (or -1 for replay).
     """
-    def __init__(self, current_dataset, candidate_ids, replay_datasets=None):
+    def __init__(self, current_dataset, candidate_ids, replay_datasets=None, repeat_rate=1):
+        if isinstance(repeat_rate, bool) or not isinstance(repeat_rate, Integral) or repeat_rate < 1:
+            raise ValueError("repeat_rate must be a positive integer")
+        self.repeat_rate = int(repeat_rate)
         self.current_dataset = current_dataset
         self.candidate_ids = candidate_ids
         self.num_current = len(current_dataset)
@@ -130,11 +137,18 @@ class ClientTaskDataset(Dataset):
         cur_offset = self.num_current
         for ds in self.replay_datasets:
             self.replay_offsets.append(cur_offset)
-            cur_offset += len(ds)
+            cur_offset += self.repeat_rate * len(ds)
         self.total_len = cur_offset
 
     def __len__(self):
         return self.total_len
+
+    def _replay_item(self, idx):
+        """Map a virtual replay index to its single stored item."""
+        for ds, offset in zip(self.replay_datasets, self.replay_offsets):
+            if offset <= idx < offset + self.repeat_rate * len(ds):
+                return ds, (idx - offset) % len(ds)
+        raise IndexError(f"Invalid replay index: {idx}")
 
     def replay_logits(self, indices):
         """Return padded targets and their class counts in replay batch order."""
@@ -142,30 +156,24 @@ class ClientTaskDataset(Dataset):
         for idx in indices.tolist():
             if idx < self.num_current:
                 continue
-            for ds, offset in zip(self.replay_datasets, self.replay_offsets):
-                if offset <= idx < offset + len(ds):
-                    if ds.logits is None:
-                        raise RuntimeError("Replay distillation targets have not been captured.")
-                    targets.append(ds.logits[idx - offset])
-                    break
-            else:
-                raise IndexError(f"Invalid replay index: {idx}")
+            ds, item_idx = self._replay_item(idx)
+            if ds.logits is None:
+                raise RuntimeError("Replay distillation targets have not been captured.")
+            targets.append(ds.logits[item_idx])
         widths = torch.tensor([target.numel() for target in targets], dtype=torch.long)
         return torch.nn.utils.rnn.pad_sequence(targets, batch_first=True), widths
 
     def __getitem__(self, idx):
+        if idx < 0 or idx >= self.total_len:
+            raise IndexError(f"Index {idx} out of range for ClientTaskDataset of length {self.total_len}")
         if idx < self.num_current:
             _, image, label = self.current_dataset[idx]
             cand_id = self.candidate_ids[idx]
             return idx, image, label, True, cand_id
         else:
-            for ds_idx, offset in enumerate(self.replay_offsets):
-                ds = self.replay_datasets[ds_idx]
-                if idx < offset + len(ds):
-                    item_idx = idx - offset
-                    _, image, label = ds[item_idx]
-                    return idx, image, label, False, -1
-            raise IndexError(f"Index {idx} out of range for ClientTaskDataset of length {self.total_len}")
+            ds, item_idx = self._replay_item(idx)
+            _, image, label = ds[item_idx]
+            return idx, image, label, False, -1
 
 
 class Exp5Base(BaseLearner):
@@ -185,6 +193,9 @@ class Exp5Base(BaseLearner):
         self.exp5a_rank = args.get("exp5a_rank", 64)
         self.exp5a_svd_oversampling = args.get("exp5a_svd_oversampling", 16)
         self.target_mode = args.get("exp5a_target_mode", "budget_scaled_sum")
+        self.repeat_rate = args.get("repeat_rate", 1)
+        if isinstance(self.repeat_rate, bool) or not isinstance(self.repeat_rate, Integral) or self.repeat_rate < 1:
+            raise ValueError("repeat_rate must be a positive integer")
         self.exp5_distill_loss = args.get("exp5_distill_loss", False)
         self.exp5_single_distill_loss = args.get("exp5_single_distill_loss", False)
         self.repo_dual = args.get("repo_dual", False)
@@ -351,7 +362,9 @@ class Exp5Base(BaseLearner):
                 Nk = len(user_groups[k])
                 cand_ids = np.arange(offsets[k], offsets[k] + Nk)
                 cur_ds = DatasetSplit(train_dataset, user_groups[k])
-                client_ds = ClientTaskDataset(cur_ds, cand_ids, self.retained_ds_all[k])
+                client_ds = ClientTaskDataset(
+                    cur_ds, cand_ids, self.retained_ds_all[k], repeat_rate=self.repeat_rate
+                )
 
                 local_loader = DataLoader(
                     client_ds, batch_size=local_bs, shuffle=True, num_workers=4
