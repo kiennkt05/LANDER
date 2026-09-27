@@ -137,6 +137,8 @@ def args_parser():
                         help='seed for initializing training.')  # 0 for train forward, 1 pretrain stage 1, 2 pretrain stage 2
 
     # FedCBDR
+    parser.add_argument('--fedcbdr_monitor_dir', default=None, help='enable baseline probe monitoring in a fresh output directory')
+    parser.add_argument('--fedcbdr_probe_per_class', type=int, default=32, help='frozen test samples per class')
     parser.add_argument('--tau_old', type=float, default=0.9, help='temperature for old classes in TTS')
     parser.add_argument('--tau_new', type=float, default=1.1, help='temperature for new classes in TTS')
     parser.add_argument('--w_old', type=float, default=1.1, help='old-class loss weight in TTS')

@@ -1,6 +1,7 @@
 import copy
 import logging
 import math
+from pathlib import Path
 from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
@@ -23,6 +24,9 @@ from utils.data_manager import (
     setup_seed,
 )
 from utils.inc_net import IncrementalNet
+from utils.task_registry import TaskRegistry
+from utils.probe_manager import ProbeManager, extract_probe_outputs
+from utils.metrics_logger import MetricsLogger
 
 
 # -----------------------------------------------------------------------------
@@ -43,9 +47,10 @@ def _label_distribution(labels):
 class TaggedDataset(Dataset):
     """Attach replay provenance and an optional experimental replay weight."""
 
-    def __init__(self, dataset, is_replay=False):
+    def __init__(self, dataset, is_replay=False, task_id=None):
         self.dataset = dataset
         self.is_replay = bool(is_replay)
+        self.task_id = int(getattr(dataset, "task_id", -1) if task_id is None else task_id)
 
     def __len__(self):
         return len(self.dataset)
@@ -56,7 +61,7 @@ class TaggedDataset(Dataset):
             weight = float(self.dataset.sampling_weights[index])
         else:
             weight = 1.0
-        return sample_id, image, int(label), self.is_replay, weight
+        return sample_id, image, int(label), self.is_replay, weight, self.task_id
 
 
 class ReplayDataset(Dataset):
@@ -73,9 +78,12 @@ class ReplayDataset(Dataset):
         transform,
         use_path,
         sampling_weights=None,
+        task_id=-1,
     ):
         indices = np.asarray(local_indices, dtype=np.int64)
         self.source_local_indices = indices
+        self.task_id = int(task_id)
+        self.source_dataset_indices = np.asarray(dataset.idxs, dtype=np.int64)[indices] if hasattr(dataset, "idxs") else indices.copy()
 
         if hasattr(dataset, "images") and dataset.images is not None:
             self.images = dataset.images[indices]
@@ -619,6 +627,7 @@ class TaskAwareTemperatureScalingLoss(nn.Module):
             scaled = scaled / sample_temperatures[:, None]
 
         losses = F.cross_entropy(scaled, labels, reduction="none")
+        self.last_sample_ce = losses.detach()
 
         if (
             self.correction_mode == "replay_loss_experimental"
@@ -669,6 +678,12 @@ class FedCBDR(BaseLearner):
         self.user_groups = {}
         self.train_dataset = None
         self.logger = logging.getLogger(__name__)
+        self.task_registry = TaskRegistry()
+        self.task_class_ranges: List[Tuple[int, int, int]] = self.task_registry.ranges
+        self.probes = ProbeManager(args.get("fedcbdr_probe_per_class", 32), self.seed)
+        monitor_dir = args.get("fedcbdr_monitor_dir")
+        self.metrics = MetricsLogger(Path(monitor_dir) / "seed_{}".format(self.seed), self.seed) if monitor_dir else None
+        self._mass = {}
 
         self._validate_options()
 
@@ -709,6 +724,8 @@ class FedCBDR(BaseLearner):
         )
 
         self._network.update_fc(self._total_classes)
+        self.task_registry.append(self._cur_task, self._known_classes, self._total_classes)
+        self.probes.add_classes(data_manager, range(self._known_classes, self._total_classes))
         self._network.cuda()
         print(
             "Learning on {}-{}".format(
@@ -823,6 +840,7 @@ class FedCBDR(BaseLearner):
                 self.user_groups[client_id],
             ),
             is_replay=False,
+            task_id=self._cur_task,
         )
         replay = [
             TaggedDataset(dataset, is_replay=True)
@@ -879,6 +897,10 @@ class FedCBDR(BaseLearner):
         for _, com in enumerate(prog_bar):
             local_weights = []
             loss_weight = []
+            self._mass = {}
+            if self.metrics:
+                before = self._probe_accuracy(self._network)
+                local_accuracy = {}
 
             idxs_users = self._selected_clients()
             lr = self._learning_rate(com)
@@ -901,12 +923,25 @@ class FedCBDR(BaseLearner):
 
                 local_weights.append(copy.deepcopy(w))
                 loss_weight.append(total_loss)
+                if self.metrics:
+                    probe_model = copy.deepcopy(self._network)
+                    probe_model.load_state_dict(w)
+                    local_accuracy[int(idx)] = self._probe_accuracy(probe_model)
+                    del probe_model
 
                 del local_train_loader, w
                 torch.cuda.empty_cache()
 
             global_weights = uniform_average_state_dicts(local_weights)
             self._network.load_state_dict(global_weights)
+            if self.metrics:
+                self._log_probe(com)
+                self.metrics.write("fedavg", self._cur_task, com, before=before,
+                                   local=local_accuracy, after=self._probe_accuracy(self._network))
+                for (c, replay), (count, mass) in self._mass.items():
+                    self.metrics.write("update_mass", self._cur_task, com, class_id=c,
+                                       class_task_id=self.task_registry.task_for(c), is_replay=replay,
+                                       draws=count, mean_ce=mass/count, ce_mass_proxy=mass)
 
             sum_loss = sum(loss_weight)
             if sum_loss < self.lowest_loss:
@@ -942,6 +977,10 @@ class FedCBDR(BaseLearner):
                     if loss_weight
                     else 0.0
                 )
+                if self.metrics:
+                    self.metrics.write("global_accuracy", self._cur_task, com, test_acc=test_acc,
+                                       test_old_acc=test_old_acc if self._cur_task > 0 else None,
+                                       test_new_acc=test_new_acc if self._cur_task > 0 else test_acc)
                 info = (
                     "Task {}, Epoch {}/{} =>  Test_accy {:.2f}, "
                     "Local_loss {:.4f}"
@@ -972,8 +1011,14 @@ class FedCBDR(BaseLearner):
         del self.best_model
         torch.cuda.empty_cache()
 
+        if self.metrics:
+            self._log_probe("selected")
+            self.metrics.set_boundary()
         # FedCBDR's next task needs this task's selected replay buffer.
         self._construct_replay_for_current_task()
+        checkpoint_dir = self.metrics.directory if self.metrics else Path(self.save_dir or "store") / "fedcbdr_seed_{}".format(self.seed)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.save_checkpoint(str(checkpoint_dir / "checkpoint"))
 
     def _local_update(self, model, train_data_loader, lr):
         print(lr)
@@ -993,12 +1038,15 @@ class FedCBDR(BaseLearner):
                 labels,
                 _,
                 _,
+                _,
             ) in enumerate(train_data_loader):
                 images = images.cuda()
                 labels = labels.cuda()
 
                 output = model(images)["logits"]
-                loss = F.cross_entropy(output, labels)
+                sample_ce = F.cross_entropy(output, labels, reduction="none")
+                loss = sample_ce.mean()
+                self._record_mass(labels, torch.zeros_like(labels, dtype=torch.bool), sample_ce)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -1042,6 +1090,7 @@ class FedCBDR(BaseLearner):
                 labels,
                 is_replay,
                 replay_weights,
+                task_ids,
             ) in enumerate(train_data_loader):
                 images = images.cuda()
                 labels = labels.cuda()
@@ -1055,6 +1104,7 @@ class FedCBDR(BaseLearner):
                     is_replay,
                     replay_weights,
                 )
+                self._record_mass(labels, is_replay, criterion.last_sample_ce)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -1073,6 +1123,44 @@ class FedCBDR(BaseLearner):
 
         total_loss = float(np.mean(losses)) if losses else 0.0
         return model.state_dict(), total_loss
+
+    def _record_mass(self, labels, replay, losses):
+        if not self.metrics:
+            return
+        with torch.no_grad():
+            for c in labels.unique().tolist():
+                for is_replay in (False, True):
+                    mask = (labels == c) & (replay.bool() == is_replay)
+                    count = int(mask.sum())
+                    if count:
+                        old_count, old_mass = self._mass.get((c, is_replay), (0, 0.0))
+                        self._mass[c, is_replay] = (old_count+count, old_mass+float(losses[mask].detach().sum()))
+
+    def _extract_probe_features(self, model, probe_loader):
+        return extract_probe_outputs(model, probe_loader, self._extract_feature_tensor)[2]
+
+    def _probe_accuracy(self, model):
+        logits, labels, _ = extract_probe_outputs(model, self.probes.loader())
+        return self.metrics.accuracy(logits, labels)
+
+    def _log_probe(self, round_id):
+        logits, labels, features = extract_probe_outputs(self._network, self.probes.loader(), self._extract_feature_tensor)
+        self.metrics.probe(self._cur_task, round_id, logits, labels, features, self.task_registry)
+
+    def save_checkpoint(self, filename):
+        replay = [[dict(task_id=ds.task_id, source_local_indices=ds.source_local_indices.copy(),
+                        source_dataset_indices=ds.source_dataset_indices.copy(),
+                        sampling_weights=ds.sampling_weights.copy(), images=ds.images,
+                        labels=ds.labels.copy(), use_path=ds.use_path)
+                   for ds in client] for client in self.retained_ds_all]
+        state = dict(schema_version=1, tasks=self._cur_task,
+                     model_state_dict={k: v.detach().cpu() for k,v in self._network.state_dict().items()},
+                     task_class_ranges=list(self.task_class_ranges), probes=self.probes.state_dict(),
+                     retained_ds_all=replay, args=self.args, user_groups=self.user_groups)
+        path = Path("{}_{}.pkl".format(filename, self._cur_task))
+        temporary = path.with_suffix(".tmp")
+        torch.save(state, temporary)
+        temporary.replace(path)
 
     def _extract_feature_tensor(self, output):
         # The supplied FedCBDR implementation expects ``features``.  LANDER's
@@ -1177,6 +1265,12 @@ class FedCBDR(BaseLearner):
         ]
         selected = selector.select(local_features)
         diagnostic = selector.last_diagnostics
+        if self.metrics:
+            self.metrics.write("gdr", self._cur_task, "selected", draw_count=diagnostic.draw_count,
+                               unique_id_count=diagnostic.unique_id_count, probability_sum=diagnostic.probability_sum,
+                               sampling_matrix_frobenius_norm=diagnostic.sampling_matrix_frobenius_norm,
+                               multiplicities=[dict(client_id=k[0], local_index=k[1], count=v)
+                                               for k,v in diagnostic.multiplicities.items()])
 
         print(
             "Task {} GDR draws={} unique={} p_sum={:.6f} "
@@ -1212,6 +1306,7 @@ class FedCBDR(BaseLearner):
                 self.train_dataset.trsf,
                 self.train_dataset.use_path,
                 weights,
+                task_id=self._cur_task,
             )
             self.retained_ds_all[client_id].append(replay)
 
