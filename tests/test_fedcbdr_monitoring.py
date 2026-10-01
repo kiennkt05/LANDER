@@ -13,6 +13,8 @@ if HAS_TORCH:
     from torch.utils.data import DataLoader, TensorDataset
     from utils.metrics_logger import MetricsLogger
     from utils.probe_manager import extract_probe_outputs
+    from utils.fedcbdr_interactions import ReplayExposureTracker, replacement_slots
+    import numpy as np
 
 
 class RegistryTests(unittest.TestCase):
@@ -48,7 +50,7 @@ class MonitoringTests(unittest.TestCase):
         self.assertTrue(torch.equal(rng, torch.random.get_rng_state()))
         self.assertTrue(torch.equal(mean, model.bn.running_mean))
 
-    def test_confusion_and_boundary_distance(self):
+    def test_directed_pair_confusion_and_boundary_margin(self):
         registry = TaskRegistry([(0, 0, 2), (1, 2, 3), (2, 3, 4)])
         labels = torch.tensor([0, 0, 0, 1, 2, 3])
         pred = torch.tensor([1, 2, 3, 1, 2, 0])
@@ -57,15 +59,59 @@ class MonitoringTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             logger = MetricsLogger(Path(temp) / "run", 1)
             logger.probe(2, 0, logits, labels, features, registry)
-            logger.set_boundary()
-            logger.probe(2, 1, logits, labels, features, registry)
+            logger.set_boundary(logits, labels)
+            logger.probe(2, 1, logits, labels, features + 1, registry)
             rows = [json.loads(line) for line in (logger.directory / "metrics.jsonl").read_text().splitlines()]
             first = next(row for row in rows if row["event"] == "class_probe" and row["class_id"] == 0)
             self.assertEqual(first["confusion_counts"]["same_old_task"], 1)
             self.assertEqual(first["confusion_counts"]["different_old_task"], 1)
             self.assertEqual(first["confusion_counts"]["old_to_current"], 1)
-            pairs = [row for row in rows if row["event"] == "pair_probe" and row["round"] == 1]
-            self.assertTrue(all(row["boundary_delta"] == 0 for row in pairs))
+            pair = torch.load(logger.directory / "pair_metrics_T2_R001.pt",
+                              weights_only=False)
+            self.assertEqual(pair["class_ids"], [0, 1, 2])
+            self.assertAlmostEqual(float(pair["pair_confusion_rate"][0, 1]), 1/3)
+            self.assertAlmostEqual(float(pair["pair_confusion_rate"][1, 0]), 0)
+            self.assertAlmostEqual(float(pair["delta_pair_margin"][0, 1]), 0)
+            self.assertAlmostEqual(float(pair["relative_feature_direction"][0, 1]), 0)
+            self.assertGreater(abs(float(pair["feature_direction"][0, 1])), 0)
+            self.assertEqual(int(pair["pair_type"][0, 1]), 0)
+            self.assertEqual(int(pair["pair_type"][0, 2]), 1)
+
+    def test_exposure_resets_history_by_epoch(self):
+        tracker = ReplayExposureTracker(3)
+        tracker.record(torch.tensor([0, 1]), torch.tensor([True, True]),
+                       torch.tensor([2.0, 3.0]))
+        tracker.record(torch.tensor([2]), torch.tensor([True]), torch.tensor([4.0]))
+        tracker.begin_epoch()
+        tracker.record(torch.tensor([1]), torch.tensor([True]), torch.tensor([5.0]))
+        state = tracker.state_dict()
+        self.assertEqual(int(state["co_batch_count"][0, 1]), 1)
+        self.assertEqual(int(state["sequential_exposure"][0, 2]), 1)
+        self.assertEqual(int(state["sequential_exposure"][0, 1]), 0)
+        self.assertEqual(int(state["min_lag"][0, 2]), 1)
+        self.assertEqual(int(state["lag_observations"][0, 2]), 1)
+        self.assertEqual(int(state["draws"].sum()), 4)
+        self.assertEqual(float(state["ce_mass"].sum()), 14.0)
+
+    def test_replacement_preserves_slots_and_weights(self):
+        def replay(labels):
+            return dict(task_id=0, images=np.array(labels), labels=np.array(labels),
+                        sampling_weights=np.arange(len(labels), dtype=float)+1)
+        original = [[replay([0, 0, 2, 2])], [replay([0, 2])]]
+        replaced, manifest = replacement_slots(original, 0, 2,
+                                               [(0, 0, 3)], max_multiplicity=2)
+        self.assertEqual(replaced[0][0]["labels"].tolist(), [2, 2, 2, 2])
+        self.assertEqual(replaced[0][0]["sampling_weights"].tolist(),
+                         original[0][0]["sampling_weights"].tolist())
+        self.assertEqual(original[0][0]["labels"].tolist(), [0, 0, 2, 2])
+        self.assertEqual(manifest[0]["max_C_multiplicity"], 2)
+        with self.assertRaises(ValueError):
+            replacement_slots(original, 0, 2, [(0, 0, 1), (1, 1, 3)])
+        duplicate_c = [[replay([0, 0, 2, 2])]]
+        duplicate_c[0][0]["source_dataset_indices"] = np.array([0, 1, 2, 2])
+        with self.assertRaises(ValueError):
+            replacement_slots(duplicate_c, 0, 2, [(0, 0, 3)],
+                              max_multiplicity=1)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,9 @@ CUDA_VISIBLE_DEVICES=0 python main.py --group=c100t5 --exp_name=fedcbdr \
   --gdr_protocol=repo_local --tts_mode=repo_dual --fast_cuda
 ```
 
+The FedCBDR T2/T4 historical-class monitoring and paired A-to-C intervention
+workflow is documented in [docs/fedcbdr_monitoring.md](docs/fedcbdr_monitoring.md).
+
 This mode uses BF16 autocast, channels-last convolutions, pinned transfers, and
 cuDNN benchmarking. It changes floating-point rounding and disables deterministic
 cuDNN selection, so compare accuracy with a standard run before relying on its

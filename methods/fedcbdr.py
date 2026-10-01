@@ -1,6 +1,7 @@
 import copy
 import logging
 import math
+import random
 from pathlib import Path
 from collections import Counter
 from dataclasses import dataclass
@@ -26,7 +27,8 @@ from utils.data_manager import (
 from utils.inc_net import IncrementalNet
 from utils.task_registry import TaskRegistry
 from utils.probe_manager import ProbeManager, extract_probe_outputs
-from utils.metrics_logger import MetricsLogger
+from utils.metrics_logger import MetricsLogger, probe_by_class
+from utils.fedcbdr_interactions import ReplayExposureTracker
 
 
 # -----------------------------------------------------------------------------
@@ -134,6 +136,22 @@ class ReplayDataset(Dataset):
             self.transform(image),
             int(self.labels[index]),
         )
+
+    def snapshot(self):
+        return dict(task_id=self.task_id,
+                    source_local_indices=self.source_local_indices.copy(),
+                    source_dataset_indices=self.source_dataset_indices.copy(),
+                    sampling_weights=self.sampling_weights.copy(),
+                    images=self.images.copy(), labels=self.labels.copy(),
+                    use_path=self.use_path)
+
+    @classmethod
+    def from_snapshot(cls, state, transform):
+        result = cls.__new__(cls)
+        for name, value in state.items():
+            setattr(result, name, value)
+        result.transform = transform
+        return result
 
 
 # -----------------------------------------------------------------------------
@@ -684,6 +702,8 @@ class FedCBDR(BaseLearner):
         monitor_dir = args.get("fedcbdr_monitor_dir")
         self.metrics = MetricsLogger(Path(monitor_dir) / "seed_{}".format(self.seed), self.seed) if monitor_dir else None
         self._mass = {}
+        self._active_tracker = None
+        self._ablation_mode = False
 
         self._validate_options()
 
@@ -852,7 +872,10 @@ class FedCBDR(BaseLearner):
 
         if not replay:
             return current
-        return ConcatDataset([current] + replay)
+        repeat = int(self.args.get("fedcbdr_replay_repeat", 1))
+        if repeat < 1:
+            raise ValueError("fedcbdr_replay_repeat must be positive")
+        return ConcatDataset([current] + replay * repeat)
 
     def _make_client_loader(self, client_id):
         return DataLoader(
@@ -865,20 +888,22 @@ class FedCBDR(BaseLearner):
             persistent_workers=self.args["num_worker"] > 0,
         )
 
-    def _fl_train(self, train_dataset, test_loader):
+    def _fl_train(self, train_dataset, test_loader, frozen_partition=False):
         self._prepare_model(self._network)
         self.best_model = None  # Best model using the lowest training loss
         self.lowest_loss = np.inf
+        self.best_round = None
 
-        user_groups, _ = partition_data(
-            train_dataset.labels,
-            beta=self.args["beta"],
-            n_parties=self.args["num_users"],
-        )
-        self.user_groups = {
-            int(client_id): indices
-            for client_id, indices in user_groups.items()
-        }
+        if not frozen_partition:
+            user_groups, _ = partition_data(
+                train_dataset.labels,
+                beta=self.args["beta"],
+                n_parties=self.args["num_users"],
+            )
+            self.user_groups = {
+                int(client_id): indices
+                for client_id, indices in user_groups.items()
+            }
 
         print(
             "FedCBDR audit: protocol={} aggregation=uniform_repo "
@@ -901,14 +926,17 @@ class FedCBDR(BaseLearner):
             for idx in range(self.args["num_users"])
         }
         client_model = copy.deepcopy(self._network)
+        if not self._ablation_mode and self._cur_task in (2, 4):
+            self.save_transition_start()
 
         for _, com in enumerate(prog_bar):
             local_weights = []
             loss_weight = []
             self._mass = {}
+            client_exposure = {}
             if self.metrics:
-                before = self._probe_accuracy(self._network)
-                local_accuracy = {}
+                before = self._probe_by_class(self._network)
+                local_by_class = {}
 
             idxs_users = self._selected_clients()
             lr = self._learning_rate(com)
@@ -916,6 +944,8 @@ class FedCBDR(BaseLearner):
             for idx in idxs_users:
                 client_model.load_state_dict(self._network.state_dict())
                 local_train_loader = client_loaders[int(idx)]
+                self._active_tracker = (ReplayExposureTracker(self._known_classes)
+                                        if self.metrics and self._known_classes else None)
 
                 if self._cur_task == 0:
                     w, total_loss = self._local_update(
@@ -933,15 +963,50 @@ class FedCBDR(BaseLearner):
                 local_weights.append({key: value.detach().clone() for key, value in w.items()})
                 loss_weight.append(total_loss)
                 if self.metrics:
-                    local_accuracy[int(idx)] = self._probe_accuracy(client_model)
+                    local_by_class[int(idx)] = self._probe_by_class(client_model)
+                    if self._active_tracker is not None:
+                        client_exposure[int(idx)] = self._active_tracker.state_dict()
+                self._active_tracker = None
 
             global_weights = uniform_average_state_dicts(local_weights)
             self._network.load_state_dict(global_weights)
             del local_weights, global_weights
             if self.metrics:
-                self._log_probe(com)
-                self.metrics.write("fedavg", self._cur_task, com, before=before,
-                                   local=local_accuracy, after=self._probe_accuracy(self._network))
+                exposure = self._pack_exposure(client_exposure)
+                self._log_probe(com, exposure=exposure)
+                if exposure is not None:
+                    for client_id in range(self.args["num_users"]):
+                        self.metrics.write("exposure_summary", self._cur_task, com,
+                                           scope="client", client_id=client_id,
+                                           replay_draws=int(exposure["draws"][client_id].sum()),
+                                           co_batch_count=int(exposure["co_batch_count"][client_id].sum()),
+                                           sequential_exposure=int(exposure["sequential_exposure"][client_id].sum()))
+                    self.metrics.write("exposure_summary", self._cur_task, com,
+                                       scope="round", client_id=None,
+                                       replay_draws=int(exposure["round_draws"].sum()),
+                                       co_batch_count=int(exposure["round_co_batch_count"].sum()),
+                                       sequential_exposure=int(exposure["round_sequential_exposure"].sum()))
+                after = self._probe_by_class(self._network)
+                weighted_local = {
+                    c: {metric: sum(local[c][metric] for local in local_by_class.values()) /
+                        len(local_by_class) for metric in ("acc", "ce", "margin")
+                        if before[c][metric] is not None}
+                    for c in before
+                }
+                local_delta = {
+                    client: {c: {metric: value[metric] - before[c][metric]
+                                 for metric in weighted_local[c]}
+                             for c, value in classes.items()}
+                    for client, classes in local_by_class.items()
+                }
+                fedavg_delta = {
+                    c: {metric: after[c][metric] - weighted_local[c][metric]
+                        for metric in weighted_local[c]} for c in before
+                }
+                self.metrics.write("fedavg_by_class", self._cur_task, com,
+                                   global_before=before, local_after=local_by_class,
+                                   global_after=after, local_delta=local_delta,
+                                   fedavg_delta=fedavg_delta)
                 for (c, replay), (count, mass) in self._mass.items():
                     self.metrics.write("update_mass", self._cur_task, com, class_id=c,
                                        class_task_id=self.task_registry.task_for(c), is_replay=replay,
@@ -951,6 +1016,7 @@ class FedCBDR(BaseLearner):
             if sum_loss < self.lowest_loss:
                 self.lowest_loss = sum_loss
                 self.best_model = copy.deepcopy(self._network.state_dict())
+                self.best_round = com
 
             if self._should_evaluate(com):
                 test_acc = self._compute_fedcbdr_accuracy(
@@ -1017,7 +1083,14 @@ class FedCBDR(BaseLearner):
 
         if self.metrics:
             self._log_probe("selected")
-            self.metrics.set_boundary()
+            self.metrics.write("selected_model", self._cur_task, "selected",
+                               source_round=self.best_round,
+                               selection_loss=float(self.lowest_loss))
+            boundary_logits, boundary_labels, _ = extract_probe_outputs(
+                self._network, self.probes.loader())
+            self.metrics.set_boundary(boundary_logits, boundary_labels)
+        if self._ablation_mode:
+            return
         # FedCBDR's next task needs this task's selected replay buffer.
         self._construct_replay_for_current_task()
         checkpoint_dir = self.metrics.directory if self.metrics else Path(self.save_dir or "store") / "fedcbdr_seed_{}".format(self.seed)
@@ -1091,6 +1164,8 @@ class FedCBDR(BaseLearner):
         losses = []
         loss_values = np.array([])
         for local_epoch in range(self.args["local_ep"]):
+            if self._active_tracker is not None:
+                self._active_tracker.begin_epoch()
             for batch_idx, (
                 _,
                 images,
@@ -1113,6 +1188,8 @@ class FedCBDR(BaseLearner):
                         replay_weights,
                     )
                 self._record_mass(labels, is_replay, criterion.last_sample_ce)
+                if self._active_tracker is not None:
+                    self._active_tracker.record(labels, is_replay, criterion.last_sample_ce)
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -1152,16 +1229,82 @@ class FedCBDR(BaseLearner):
         logits, labels, _ = extract_probe_outputs(model, self.probes.loader())
         return self.metrics.accuracy(logits, labels)
 
-    def _log_probe(self, round_id):
+    def _probe_by_class(self, model):
+        logits, labels, _ = extract_probe_outputs(model, self.probes.loader())
+        return probe_by_class(logits, labels)
+
+    def _pack_exposure(self, client_states):
+        if not self._known_classes:
+            return None
+        empty = ReplayExposureTracker(self._known_classes).state_dict()
+        ordered = [client_states.get(k, empty) for k in range(self.args["num_users"])]
+        result = {name: torch.stack([state[name] for state in ordered])
+                  for name in empty}
+        for name in ("co_batch_count", "sequential_exposure", "draws", "ce_mass",
+                     "lag_sum", "lag_observations"):
+            result["round_" + name] = result[name].sum(0)
+        observations = result["round_lag_observations"]
+        mean = torch.full_like(result["round_lag_sum"], float("nan"))
+        valid = observations > 0
+        mean[valid] = result["round_lag_sum"][valid] / observations[valid]
+        result["round_mean_lag"] = mean
+        minimum = result["min_lag"].clone()
+        minimum[minimum < 0] = torch.iinfo(minimum.dtype).max
+        result["round_min_lag"] = minimum.min(0).values
+        result["round_min_lag"][result["round_min_lag"] ==
+                                torch.iinfo(minimum.dtype).max] = -1
+        mass_a = result["ce_mass"][:, :, None]
+        mass_b = result["ce_mass"][:, None, :]
+        result["mass_a_over_b"] = torch.where(
+            mass_b > 0, mass_a / mass_b.clamp_min(torch.finfo(mass_b.dtype).eps),
+            torch.full_like(mass_a / mass_b.clamp_min(1), float("nan")))
+        round_mass = result["round_ce_mass"]
+        result["round_mass_a_over_b"] = torch.where(
+            round_mass[None, :] > 0,
+            round_mass[:, None] / round_mass[None, :].clamp_min(torch.finfo(round_mass.dtype).eps),
+            torch.full((self._known_classes, self._known_classes), float("nan"),
+                       dtype=round_mass.dtype))
+        return result
+
+    def _log_probe(self, round_id, exposure=None):
         logits, labels, features = extract_probe_outputs(self._network, self.probes.loader(), self._extract_feature_tensor)
-        self.metrics.probe(self._cur_task, round_id, logits, labels, features, self.task_registry)
+        self.metrics.probe(self._cur_task, round_id, logits, labels, features,
+                           self.task_registry, exposure=exposure)
+
+    def save_transition_start(self):
+        directory = self.metrics.directory if self.metrics else (
+            Path(self.save_dir or "store") / "fedcbdr_seed_{}".format(self.seed))
+        directory.mkdir(parents=True, exist_ok=True)
+        state = dict(
+            schema_version=1, task=self._cur_task,
+            known_classes=self._known_classes, total_classes=self._total_classes,
+            model_state_dict={k: v.detach().cpu().clone()
+                              for k, v in self._network.state_dict().items()},
+            task_class_ranges=list(self.task_class_ranges),
+            class_order=list(self.args["class_order"]),
+            retained_ds_all=[[ds.snapshot() for ds in client]
+                             for client in self.retained_ds_all],
+            probes=self.probes, train_dataset=self.train_dataset,
+            test_dataset=self.test_loader.dataset,
+            old_dataset=self.old_loader.dataset if self._cur_task > 0 else None,
+            new_dataset=self.new_loader.dataset if self._cur_task > 0 else None,
+            user_groups=copy.deepcopy(self.user_groups),
+            python_rng=random.getstate(), numpy_rng=np.random.get_state(),
+            torch_rng=torch.random.get_rng_state(),
+            cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            metrics_previous=copy.deepcopy(self.metrics.previous) if self.metrics else {},
+            metrics_boundary=copy.deepcopy(self.metrics.boundary) if self.metrics else {},
+            boundary_class_metrics=copy.deepcopy(self.metrics.boundary_class_metrics)
+                if self.metrics else {},
+            args=copy.deepcopy(self.args),
+        )
+        path = directory / "transition_start_T{}.pkl".format(self._cur_task)
+        temporary = path.with_suffix(".tmp")
+        torch.save(state, temporary)
+        temporary.replace(path)
 
     def save_checkpoint(self, filename):
-        replay = [[dict(task_id=ds.task_id, source_local_indices=ds.source_local_indices.copy(),
-                        source_dataset_indices=ds.source_dataset_indices.copy(),
-                        sampling_weights=ds.sampling_weights.copy(), images=ds.images,
-                        labels=ds.labels.copy(), use_path=ds.use_path)
-                   for ds in client] for client in self.retained_ds_all]
+        replay = [[ds.snapshot() for ds in client] for client in self.retained_ds_all]
         state = dict(schema_version=1, tasks=self._cur_task,
                      model_state_dict={k: v.detach().cpu() for k,v in self._network.state_dict().items()},
                      task_class_ranges=list(self.task_class_ranges), probes=self.probes.state_dict(),
