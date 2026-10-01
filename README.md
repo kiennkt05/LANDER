@@ -68,14 +68,14 @@ For example, for `cifar100-5tasks`, please run the following commands to test th
 
 ```
 #!/bin/bash
-# method= ["finetue", "lwf", "ewc", "icarl", "target"]
+# method= ["finetune", "lwf", "ewc", "icarl", "target"]
 
-CUDA_VISIBLE_DEVICES=0 python main.py --group=c100t5 --exp_name=$method_b05 --dataset cifar100 --method=$method --tasks=5 --num_users 5 --beta=0.5
+CUDA_VISIBLE_DEVICES=0 python main.py --group=c100t5 --exp_name=$method_b05 --dataset cifar100 --method=$method --tasks=5 --num_users 5 --beta=0.5 --fedcbdr_lr_scheduler='cosine'
 ```
 
 ### Ours
 ```
-CUDA_VISIBLE_DEVICES=0 python main.py --group=c100t5 --exp_name=lander_b05 --dataset cifar100 --method=lander --tasks=5 --num_users 5 --beta=0.5
+CUDA_VISIBLE_DEVICES=0 python main.py --group=c100t5 --exp_name=lander_b05 --dataset cifar100 --method=lander --tasks=5 --num_users 5 --beta=0.5 --fedcbdr_lr_scheduler='cosine'
 ```
 
 ### Forgetting Calculator

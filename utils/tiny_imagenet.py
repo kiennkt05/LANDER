@@ -1,5 +1,4 @@
 import os
-import pandas as pd
 import warnings
 from torchvision.datasets import ImageFolder
 from torchvision.datasets import VisionDataset

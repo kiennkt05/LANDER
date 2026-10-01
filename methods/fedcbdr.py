@@ -822,7 +822,10 @@ class FedCBDR(BaseLearner):
 
     def _learning_rate(self, round_id):
         base = float(self.args["local_lr"])
-        schedule = self.args.get("fedcbdr_lr_schedule", "constant")
+        schedule = self.args.get(
+            "fedcbdr_lr_scheduler",
+            self.args.get("fedcbdr_lr_schedule", "constant"),
+        )
 
         if schedule == "constant":
             return base

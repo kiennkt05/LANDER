@@ -7,11 +7,18 @@ from torch.utils.data import DataLoader
 from utils.inc_net import IncrementalNet
 from methods.base import BaseLearner
 from utils.data_manager import partition_data, DatasetSplit, average_weights, setup_seed
-import copy, wandb
+import copy
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import torch.nn.functional as F
 from torch.autograd import Variable
 from torchvision import transforms
-from kornia import augmentation
+try:
+    from kornia import augmentation
+except ImportError:
+    augmentation = None
 import time, os, math
 import torch.nn.init as init
 from PIL import Image
@@ -572,7 +579,16 @@ class LANDER(BaseLearner):
         self.class_order = torch.tensor(args["class_order"], device=args["gpu"])
         le_name = "label_embedding/" + args['dataset'] + "_le.pickle"
         with open(le_name, "rb") as label_file:
-            label_emb = pickle.load(label_file)
+            if torch.cuda.is_available():
+                label_emb = pickle.load(label_file)
+            else:
+                import io
+                class CPU_Unpickler(pickle.Unpickler):
+                    def find_class(self, module, name):
+                        if module == 'torch.storage' and name == '_load_from_bytes':
+                            return lambda b: torch.load(io.BytesIO(b), map_location='cpu', weights_only=False)
+                        return super().find_class(module, name)
+                label_emb = CPU_Unpickler(label_file).load()
             label_emb = label_emb[self.class_order]
             self.label_emb = label_emb.to(args['gpu']).float().detach()
         self.r = args['r']
@@ -761,10 +777,7 @@ class LANDER(BaseLearner):
         user_groups, _ = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
         prog_bar = tqdm(range(self.args["com_round"]))
         optimizer = torch.optim.SGD(self._network.parameters(), lr=self.args['local_lr'], momentum=0.9, weight_decay=self.args['weight_decay'])
-        if self.args["dataset"] == "tiny_imagenet" or self.args["dataset"] == "imagenet":
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 75], gamma=0.1)
-        else:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.args["com_round"], eta_min=1e-3)
+        scheduler = self._init_scheduler(optimizer)
         local_train_loaders = [
             DataLoader(DatasetSplit(train_dataset, user_groups[idx]),
                        batch_size=self.args["local_bs"], shuffle=True,
@@ -778,16 +791,17 @@ class LANDER(BaseLearner):
             local_weights = []
             idxs_users = range(self.args["num_users"])
             loss_weight = []
+            current_lr = scheduler.get_last_lr()[0]
             for idx in idxs_users:
                 client_model.load_state_dict(self._network.state_dict())
                 local_train_loader = local_train_loaders[idx]
                 if self._cur_task == 0:
-                    w, total_loss = self._local_update(client_model, local_train_loader, scheduler.get_last_lr()[0])
+                    w, total_loss = self._local_update(client_model, local_train_loader, current_lr)
                 else:
                     w, total_syn, total_local, total_loss = self._local_finetune(self._old_network,
                                                                                  client_model,
                                                                                  local_train_loader, self._cur_task,
-                                                                                 idx, scheduler.get_last_lr()[0])
+                                                                                 idx, current_lr)
                     if com == 0 and self._cur_task == 1:
                         print("\t \t client {}, local dataset size:{},  syntheic data size:{}".format(idx, total_local,
                                                                                                       total_syn))

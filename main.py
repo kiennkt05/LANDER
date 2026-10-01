@@ -170,7 +170,7 @@ def args_parser():
     parser.add_argument('--gdr_correction_mode', type=str, default='none', choices=['none', 'sampling_matrix', 'replay_loss_experimental'], help='GDR sampling correction')
     parser.add_argument('--tts_mode', type=str, default='paper_eq', choices=['paper_eq', 'repo_dual'], help='task-aware temperature-scaling implementation')
     parser.add_argument('--joint_loss', type=str, default='tts', choices=['tts'], help='FedCBDR joint-training loss')
-    parser.add_argument('--fedcbdr_lr_schedule', type=str, default='constant', choices=['constant', 'cosine'], help='FedCBDR local learning-rate schedule')
+    parser.add_argument('--fedcbdr_lr_scheduler', type=str, default='constant', choices=['constant', 'cosine'], help='FedCBDR local learning-rate schedule')
 
     # Exp5 Trajectory Subspace Replay
     parser.add_argument('--repeat_rate', default=1, type=int, help='number of appearances per retained replay item in each Exp5 local epoch (positive integer; current items appear once)')

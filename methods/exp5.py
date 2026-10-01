@@ -334,7 +334,11 @@ class Exp5Base(BaseLearner):
         task_pred_delta_theta = torch.zeros(D, dtype=torch.float32)
         task_actual_delta_theta = torch.zeros(D, dtype=torch.float32)
 
+        optimizer_head = torch.optim.SGD(self._network.parameters(), lr=local_lr, momentum=momentum, weight_decay=weight_decay)
+        scheduler = self._init_scheduler(optimizer_head)
+
         for com in prog_bar:
+            current_lr = scheduler.get_last_lr()[0]
             # Snapshot head parameters before local training
             head_before = torch.cat([
                 self._network.fc.weight.data.flatten(),
@@ -371,7 +375,7 @@ class Exp5Base(BaseLearner):
 
                 optimizer = torch.optim.SGD(
                     local_model.parameters(),
-                    lr=local_lr,
+                    lr=current_lr,
                     momentum=momentum,
                     weight_decay=weight_decay,
                     dampening=0.0,
@@ -422,7 +426,7 @@ class Exp5Base(BaseLearner):
                             cur_g = torch.cat([cur_grad_W, cur_q], dim=1)
 
                             # delta v_i,s = -eta_a * p_k * W_s * g_i,s
-                            step_coeff = -local_lr * p_k * W_s
+                            step_coeff = -current_lr * p_k * W_s
                             delta_v = step_coeff * cur_g
                             self.trajectory_matrix[cur_cands] += delta_v.detach().cpu()
 
@@ -441,7 +445,7 @@ class Exp5Base(BaseLearner):
                         else:
                             g_rep_sum = torch.zeros(D, dtype=torch.float32)
 
-                        step_coeff = -local_lr * p_k * W_s
+                        step_coeff = -current_lr * p_k * W_s
                         round_delta_cur += step_coeff * g_cur_sum
                         round_delta_rep += step_coeff * g_rep_sum
                         round_delta_wd += (step_coeff * weight_decay) * theta_head
@@ -457,6 +461,7 @@ class Exp5Base(BaseLearner):
             # FedAvg aggregation
             global_weights = average_weights(local_weights)
             self._network.load_state_dict(global_weights)
+            scheduler.step()
 
             sum_loss = sum(loss_weight)
             if sum_loss < self.lowest_loss:

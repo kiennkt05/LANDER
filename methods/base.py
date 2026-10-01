@@ -1,11 +1,15 @@
 import copy
 import logging
+import math
 import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from utils.toolkit import tensor2numpy, accuracy
-from scipy.spatial.distance import cdist
+try:
+    from scipy.spatial.distance import cdist
+except ImportError:
+    cdist = None
 from utils.data_manager import DummyDataset, _get_idata
 from torchvision import transforms
 
@@ -60,6 +64,16 @@ class BaseLearner(object):
     def _should_evaluate(self, round_id):
         return ((round_id + 1) % self.args.get("eval_interval", 1) == 0 or
                 round_id + 1 == self.args["com_round"])
+
+    def _init_scheduler(self, optimizer):
+        if self.args["dataset"] == "tiny_imagenet":
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 75], gamma=0.1)
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.args["com_round"], eta_min=1e-3)
+        return scheduler
+
+    def _get_scheduler(self, optimizer):
+        return self._init_scheduler(optimizer)
 
     def _client_loaders(self, train_dataset, user_groups):
         workers = self.args["num_worker"]

@@ -7,8 +7,15 @@ from torch.utils.data import DataLoader
 from utils.inc_net import IncrementalNet
 from methods.base import BaseLearner
 from utils.data_manager import partition_data, DatasetSplit, average_weights, setup_seed
-import copy, wandb
-from sklearn.metrics import confusion_matrix
+import copy
+try:
+    import wandb
+except ImportError:
+    wandb = None
+try:
+    from sklearn.metrics import confusion_matrix
+except ImportError:
+    confusion_matrix = None
 
 # init_epoch = 200
 # com_round = 100  
@@ -146,9 +153,11 @@ class Finetune(BaseLearner):
     #             optimizer.step()
     #     return model.state_dict()
 
-    def _local_update(self, model, train_data_loader):
+    def _local_update(self, model, train_data_loader, lr=None):
         model.train()
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
+        if lr is None:
+            lr = self.args.get("local_lr", 0.01)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
         for iter in range(self.args["local_ep"]):
             for batch_idx, (_, images, labels) in enumerate(train_data_loader):
                 images, labels = self._prepare_images(images), labels.cuda(non_blocking=True)
@@ -187,9 +196,11 @@ class Finetune(BaseLearner):
 
         
 
-    def _local_finetune(self, model, train_data_loader):
+    def _local_finetune(self, model, train_data_loader, lr=None):
         model.train()
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
+        if lr is None:
+            lr = self.args.get("local_lr", 0.01)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
         # print_data_stats(0, train_data_loader)
         for iter in range(self.args["local_ep"]):
             for batch_idx, (_, images, labels) in enumerate(train_data_loader):
@@ -211,21 +222,25 @@ class Finetune(BaseLearner):
         user_groups, _ = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
         prog_bar = tqdm(range(self.args["com_round"]))
         local_loaders = self._client_loaders(train_dataset, user_groups)
+        optimizer = torch.optim.SGD(self._network.parameters(), lr=self.args.get("local_lr", 0.01), momentum=0.9, weight_decay=5e-4)
+        scheduler = self._init_scheduler(optimizer)
         client_model = copy.deepcopy(self._network)
         for _, com in enumerate(prog_bar):
             local_weights = []
             idxs_users = range(self.args["num_users"])
+            current_lr = scheduler.get_last_lr()[0]
             for idx in idxs_users:
                 client_model.load_state_dict(self._network.state_dict())
                 local_train_loader = local_loaders[idx]
                 if self._cur_task == 0:
-                    w = self._local_update(client_model, local_train_loader)
+                    w = self._local_update(client_model, local_train_loader, lr=current_lr)
                 else:
-                    w = self._local_finetune(client_model, local_train_loader)
+                    w = self._local_finetune(client_model, local_train_loader, lr=current_lr)
                 local_weights.append({key: value.detach().clone() for key, value in w.items()})
             # update global weights
             global_weights = average_weights(local_weights)
             self._network.load_state_dict(global_weights)
+            scheduler.step()
             cls_acc = self.per_cls_acc(self.test_loader, self._network)
             cls_acc_list.append(cls_acc)
             if self._should_evaluate(com):
