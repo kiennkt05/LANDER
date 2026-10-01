@@ -822,16 +822,13 @@ class FedCBDR(BaseLearner):
 
     def _learning_rate(self, round_id):
         base = float(self.args["local_lr"])
-        schedule = self.args.get(
-            "fedcbdr_lr_scheduler",
-            self.args.get("fedcbdr_lr_schedule", "constant"),
-        )
+        scheduler = self.args["fedcbdr_lr_scheduler"]
 
-        if schedule == "constant":
+        if scheduler == "constant":
             return base
 
         # Preserve the supplied implementation: every non-constant mode uses
-        # the cosine schedule below.
+        # the cosine scheduler below.
         eta_min = min(1e-3, base)
         return eta_min + 0.5 * (base - eta_min) * (
             1

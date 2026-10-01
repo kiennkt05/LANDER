@@ -116,7 +116,7 @@ The runner preflights all arms, trains one baseline per replay-repeat setting,
 and trains one A-to-C arm per unique pair. Each arm starts from the same model,
 partition, replay snapshot and RNG. A slots retain position and replay weight;
 their image/label is replaced by a deterministic, client-local C donor from
-A's task. Minibatch order, client schedule, augmentation draws, optimizer and
+A's task. Minibatch order, client scheduler, augmentation draws, optimizer and
 FedAvg remain paired. C donor counts and maximum/mean reuse are recorded in
 `manifest.json`; multiplicity includes existing C replay draws and the new A
 slots. Excessive reuse rejects the arm. No GDR reselection occurs.

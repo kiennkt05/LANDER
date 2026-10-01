@@ -40,7 +40,7 @@ the FedCBDR configuration can be launched as follows:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python main.py --group=c100t5 --exp_name=fedcbdr \
-  --dataset=cifar100 --method=fedcbdr --fedcbdr_lr_schedule=cosine \
+  --dataset=cifar100 --method=fedcbdr --fedcbdr_lr_scheduler=cosine \
   --tasks=5 --num_users=5 --beta=0.1 --seed=2023 \
   --gdr_protocol=repo_local --tts_mode=repo_dual --fast_cuda
 ```

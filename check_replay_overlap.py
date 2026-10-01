@@ -313,7 +313,7 @@ def run_and_capture():
         "gdr_correction_mode": "none",
         "tts_mode": "repo_dual",
         "joint_loss": "tts",
-        "fedcbdr_lr_schedule": "constant",
+        "fedcbdr_lr_scheduler": "constant",
         "repo_dual": False,
         "exp5_distill_loss": False,
         "exp5_single_distill_loss": False,
