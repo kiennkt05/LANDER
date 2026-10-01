@@ -75,6 +75,7 @@ def run_arm(state, replay, directory, name, repeat):
     args = copy.deepcopy(state["args"])
     args["fedcbdr_monitor_dir"] = None
     args["fedcbdr_replay_repeat"] = int(repeat)
+    args.setdefault("fedcbdr_lr_scheduler", args.get("fedcbdr_lr_schedule", "constant"))
     learner = FedCBDR(args)
     learner._cur_task = int(state["task"])
     learner._known_classes = int(state["known_classes"])

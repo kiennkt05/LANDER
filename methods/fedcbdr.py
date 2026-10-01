@@ -820,25 +820,6 @@ class FedCBDR(BaseLearner):
             return np.arange(users)
         return np.random.choice(users, count, replace=False)
 
-    def _learning_rate(self, round_id):
-        base = float(self.args["local_lr"])
-        scheduler = self.args["fedcbdr_lr_scheduler"]
-
-        if scheduler == "constant":
-            return base
-
-        # Preserve the supplied implementation: every non-constant mode uses
-        # the cosine scheduler below.
-        eta_min = min(1e-3, base)
-        return eta_min + 0.5 * (base - eta_min) * (
-            1
-            + math.cos(
-                math.pi
-                * round_id
-                / max(1, int(self.args["com_round"]))
-            )
-        )
-
     def _compute_fedcbdr_accuracy(self, model, loader):
         # LANDER's verified BaseLearner contract is the two-argument form.
         # Retain compatibility with the supplied FedCBDR's optional scaled
@@ -929,6 +910,9 @@ class FedCBDR(BaseLearner):
         if not self._ablation_mode and self._cur_task in (2, 4):
             self.save_transition_start()
 
+        optimizer = torch.optim.SGD(self._network.parameters(), lr=self.args['local_lr'], momentum=0.9, weight_decay=self.args.get('weight_decay', 1e-5))
+        scheduler = self._init_scheduler(optimizer)
+
         for _, com in enumerate(prog_bar):
             local_weights = []
             loss_weight = []
@@ -939,7 +923,7 @@ class FedCBDR(BaseLearner):
                 local_by_class = {}
 
             idxs_users = self._selected_clients()
-            lr = self._learning_rate(com)
+            lr = scheduler.get_last_lr()[0]
 
             for idx in idxs_users:
                 client_model.load_state_dict(self._network.state_dict())
@@ -971,6 +955,7 @@ class FedCBDR(BaseLearner):
             global_weights = uniform_average_state_dicts(local_weights)
             self._network.load_state_dict(global_weights)
             del local_weights, global_weights
+            scheduler.step()
             if self.metrics:
                 exposure = self._pack_exposure(client_exposure)
                 self._log_probe(com, exposure=exposure)
