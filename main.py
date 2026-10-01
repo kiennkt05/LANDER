@@ -8,10 +8,6 @@ except ImportError:
 from utils.data_manager import DataManager, setup_seed
 from utils.toolkit import count_parameters
 from methods.finetune import Finetune
-from methods.icarl import iCaRL
-from methods.lwf import LwF
-from methods.ewc import EWC
-from methods.target import TARGET
 from methods.lander import LANDER
 from methods.exp5 import Exp5aLocal, Exp5aGlobal, Exp5bTopK, Exp5bFedCBDR
 from methods.exp6 import Exp6Global, Exp6bGlobal
