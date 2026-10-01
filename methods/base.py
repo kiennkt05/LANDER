@@ -41,6 +41,42 @@ class BaseLearner(object):
         self._device = "0"
         # self._multiple_gpus = args["device"]
 
+    def _prepare_model(self, model):
+        model = model.cuda()
+        if self.args.get("fast_cuda", False):
+            model.to(memory_format=torch.channels_last)
+        return model
+
+    def _prepare_images(self, images):
+        if self.args.get("fast_cuda", False):
+            return images.to(device="cuda", non_blocking=True,
+                             memory_format=torch.channels_last)
+        return images.cuda(non_blocking=True)
+
+    def _autocast(self):
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                              enabled=self.args.get("fast_cuda", False))
+
+    def _should_evaluate(self, round_id):
+        return ((round_id + 1) % self.args.get("eval_interval", 1) == 0 or
+                round_id + 1 == self.args["com_round"])
+
+    def _client_loaders(self, train_dataset, user_groups):
+        workers = self.args["num_worker"]
+        return [
+            DataLoader(DatasetSplit(train_dataset, user_groups[idx]),
+                       batch_size=self.args["local_bs"], shuffle=True,
+                       num_workers=workers, pin_memory=True,
+                       persistent_workers=workers > 0)
+            for idx in range(self.args["num_users"])
+        ]
+
+    def _test_data_loader(self, dataset):
+        workers = self.args["num_worker"]
+        return DataLoader(dataset, batch_size=256, shuffle=False,
+                          num_workers=workers, pin_memory=True,
+                          persistent_workers=workers > 0)
+
     @property
     def exemplar_size(self):
         assert len(self._data_memory) == len(
@@ -154,23 +190,34 @@ class BaseLearner(object):
 
     def _compute_accuracy(self, model, loader):
         model.eval()
-        correct, total = 0, 0
+        correct = torch.zeros((), dtype=torch.int64, device="cuda")
+        total = 0
         for i, (_, inputs, targets) in enumerate(loader):
-            inputs = inputs.cuda()
-            with torch.no_grad():
+            if self.args.get("fast_cuda", False):
+                inputs = inputs.to(device="cuda", non_blocking=True,
+                                   memory_format=torch.channels_last)
+            else:
+                inputs = inputs.cuda(non_blocking=True)
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                                                 enabled=self.args.get("fast_cuda", False)):
                 outputs = model(inputs)["logits"]
             predicts = torch.max(outputs, dim=1)[1]
-            correct += (predicts.cpu() == targets).sum()
+            correct += (predicts == targets.cuda(non_blocking=True)).sum()
             total += len(targets)
 
-        return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+        return np.around(correct.item() * 100 / total, decimals=2)
 
     def _eval_cnn(self, loader):
         self._network.eval()
         y_pred, y_true = [], []
         for _, (_, inputs, targets) in enumerate(loader):
-            inputs = inputs.cuda()
-            with torch.no_grad():
+            if self.args.get("fast_cuda", False):
+                inputs = inputs.to(device="cuda", non_blocking=True,
+                                   memory_format=torch.channels_last)
+            else:
+                inputs = inputs.cuda(non_blocking=True)
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16,
+                                                 enabled=self.args.get("fast_cuda", False)):
                 outputs = self._network(inputs)["logits"]
             predicts = torch.max(outputs, dim=1)[1]  # [bs] Top-1 prediction
             y_pred.append(predicts.cpu().numpy())
@@ -195,11 +242,11 @@ class BaseLearner(object):
             _targets = _targets.numpy()
             if isinstance(self._network, nn.DataParallel):
                 _vectors = tensor2numpy(
-                    self._network.module.extract_vector(_inputs.cuda())
+                    self._network.module.extract_vector(self._prepare_images(_inputs))
                 )
             else:
                 _vectors = tensor2numpy(
-                    self._network.extract_vector(_inputs.cuda())
+                    self._network.extract_vector(self._prepare_images(_inputs))
                 )
 
             vectors.append(_vectors)

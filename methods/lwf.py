@@ -70,11 +70,9 @@ class LwF(BaseLearner):
         )
         # if self.args["dataset"] != "tiny_imagenet":
 
-        self.test_loader = DataLoader(
-            test_dataset, batch_size=256, shuffle=False, num_workers=4
-        )
+        self.test_loader = self._test_data_loader(test_dataset)
 
-        setup_seed(self.seed)
+        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
         self._fl_train(train_dataset, self.test_loader)
 
         # if len(self._multiple_gpus) > 1:
@@ -90,10 +88,11 @@ class LwF(BaseLearner):
             # import pdb
             # pdb.set_trace()
             for batch_idx, (_, images, labels) in enumerate(train_data_loader):
-                images, labels = images.cuda(), labels.cuda()
-                output = model(images)["logits"]
-                loss = F.cross_entropy(output, labels)
-                optimizer.zero_grad()
+                images, labels = self._prepare_images(images), labels.cuda(non_blocking=True)
+                with self._autocast():
+                    output = model(images)["logits"]
+                    loss = F.cross_entropy(output, labels)
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
         return model.state_dict()
@@ -103,43 +102,44 @@ class LwF(BaseLearner):
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
         for iter in range(self.args["local_ep"]):
             for batch_idx, (_, images, labels) in enumerate(train_data_loader):
-                images, labels = images.cuda(), labels.cuda()
+                images, labels = self._prepare_images(images), labels.cuda(non_blocking=True)
                 fake_targets = labels - self._known_classes
-                output = model(images)["logits"]
-                loss_clf = F.cross_entropy(
-                    output[:, self._known_classes :], fake_targets  # logits[10:20] -- 0~9 class
-                )
-                loss_kd = _KD_loss(
-                    output[:, : self._known_classes],   # logits on previous tasks
-                    self._old_network(images)["logits"],
-                    T,
-                )
-                loss = lamda * loss_kd + loss_clf # 25 * loss_kd + loss_clf # lamda * loss_kd + loss_clf
-                optimizer.zero_grad()
+                with self._autocast():
+                    output = model(images)["logits"]
+                    loss_clf = F.cross_entropy(
+                        output[:, self._known_classes :], fake_targets
+                    )
+                    with torch.no_grad():
+                        old_logits = self._old_network(images)["logits"]
+                    loss_kd = _KD_loss(output[:, : self._known_classes], old_logits, T)
+                    loss = lamda * loss_kd + loss_clf
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
         return model.state_dict()
 
 
     def _fl_train(self, train_dataset, test_loader):
-        self._network.cuda()
-        user_groups = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
+        self._prepare_model(self._network)
+        user_groups, _ = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
         prog_bar = tqdm(range(self.args["com_round"]))
+        local_loaders = self._client_loaders(train_dataset, user_groups)
+        client_model = copy.deepcopy(self._network)
         for _, com in enumerate(prog_bar):
             local_weights = []
             idxs_users = range(self.args["num_users"])
             for idx in idxs_users:
-                local_train_loader = DataLoader(DatasetSplit(train_dataset, user_groups[idx]), 
-                    batch_size=self.args["local_bs"], shuffle=True, num_workers=4)
+                client_model.load_state_dict(self._network.state_dict())
+                local_train_loader = local_loaders[idx]
                 if self._cur_task == 0:
-                    w = self._local_update(copy.deepcopy(self._network), local_train_loader)
+                    w = self._local_update(client_model, local_train_loader)
                 else:
-                    w = self._local_finetune(copy.deepcopy(self._network), local_train_loader)
-                local_weights.append(copy.deepcopy(w))
+                    w = self._local_finetune(client_model, local_train_loader)
+                local_weights.append({key: value.detach().clone() for key, value in w.items()})
             # update global weights
             global_weights = average_weights(local_weights)
             self._network.load_state_dict(global_weights)
-            if com % 1 == 0:
+            if self._should_evaluate(com):
                 # pdb.set_trace()
                 test_acc = self._compute_accuracy(self._network, test_loader)
                 info=("Task {}, Epoch {}/{} =>  Test_accy {:.2f}".format(
@@ -147,6 +147,7 @@ class LwF(BaseLearner):
                 prog_bar.set_description(info)
                 if self.wandb == 1:
                     wandb.log({'Task_{}, accuracy'.format(self._cur_task): test_acc})
+        del client_model, local_loaders
 
 
     # def _train(self, train_loader, test_loader):

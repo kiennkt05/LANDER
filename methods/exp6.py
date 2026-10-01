@@ -38,6 +38,7 @@ def _exp5a_global_projection(
     seed=42,
     cur_task=0,
     mask_seed_offset=5000,
+    fast_cuda=False,
 ):
     """Shared global trajectory subspace projection via orthogonal masking and pooled randomized SVD.
 
@@ -112,7 +113,7 @@ def _exp5a_global_projection(
     r_glob = min(rank, N, D)
     q = min(r_glob + svd_oversampling, N, D)
 
-    setup_seed(seed + cur_task * 1000)
+    setup_seed(seed + cur_task * 1000, fast_cuda=fast_cuda)
     U_prime, S_prime, V_prime = torch.pca_lowrank(X_prime, q=q, center=False)
     R_prime_r = V_prime[:, :r_glob]
 
@@ -729,6 +730,7 @@ class Exp6Global(Exp5aGlobal):
             seed=self.seed,
             cur_task=self._cur_task,
             mask_seed_offset=self.exp5a_mask_seed_offset,
+            fast_cuda=self.args.get("fast_cuda", False),
         )
         rho_global = diagnostics["rho_global"]
         print(f"[{self.exp6_variant_name}-Global] Global retained trajectory energy rho_global: {rho_global:.4f}")
@@ -844,11 +846,9 @@ unique={metrics['unique']}
             source="test",
             mode="test",
         )
-        self.test_loader = DataLoader(
-            test_dataset, batch_size=256, shuffle=False, num_workers=4
-        )
+        self.test_loader = self._test_data_loader(test_dataset)
 
-        setup_seed(self.seed)
+        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
         partition_res = partition_data(
             train_dataset.labels, beta=self.args["beta"], n_parties=self.num_users
         )
@@ -893,7 +893,7 @@ unique={metrics['unique']}
         self.trajectory_matrix = torch.zeros((N, D), dtype=torch.float32)
 
         # 3. Federated Training with exact trajectory accumulation
-        self._network.cuda()
+        self._prepare_model(self._network)
         self._fl_train(train_dataset, user_groups, offsets, D)
 
         # 4. Trajectory projection into rank-r subspace

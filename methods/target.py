@@ -198,7 +198,7 @@ def reset_l0_fun(model):
 
 def save_image_batch(imgs, output, col=None, size=None, pack=True):
     if isinstance(imgs, torch.Tensor):
-        imgs = (imgs.detach().clamp(0, 1).cpu().numpy() * 255).astype('uint8')
+        imgs = (imgs.detach().float().clamp(0, 1).cpu().numpy() * 255).astype('uint8')
     base_dir = os.path.dirname(output)
     if base_dir != '':
         os.makedirs(base_dir, exist_ok=True)
@@ -237,9 +237,9 @@ class DeepInversionHook():
 
     def hook_fn(self, module, input, output):
         # hook co compute deepinversion's feature distribution regularization
-        nch = input[0].shape[1]
-        mean = input[0].mean([0, 2, 3])
-        var = input[0].permute(1, 0, 2, 3).contiguous().view([nch, -1]).var(1, unbiased=False)
+        activations = input[0].float()
+        mean = activations.mean(dim=(0, 2, 3))
+        var = activations.var(dim=(0, 2, 3), unbiased=False)
         # forcing mean and variance to match between two distributions
         # other ways might work better, i.g. KL divergence
         if self.mmt is None:
@@ -344,6 +344,7 @@ class GlobalSynthesizer(ABC):
         super(GlobalSynthesizer, self).__init__()
         self.teacher = teacher
         self.student = student
+        self.teacher.requires_grad_(False)
         self.save_dir = save_dir
         self.img_size = img_size
         self.iterations = iterations
@@ -392,8 +393,9 @@ class GlobalSynthesizer(ABC):
     def synthesize(self, targets=None):
         self.ep += 1
         self.student.eval()
+        self.student.requires_grad_(False)
         self.teacher.eval()
-        best_cost = 1e6
+        best_cost = None
 
         if (self.ep == 120 + self.ep_start) and self.reset_l0:
             reset_l0_fun(self.generator)
@@ -408,6 +410,8 @@ class GlobalSynthesizer(ABC):
         targets = targets.cuda()
 
         fast_generator = self.generator.clone()
+        if self.args.get("fast_cuda", False):
+            fast_generator.to(memory_format=torch.channels_last)
         optimizer = torch.optim.Adam([
             {'params': fast_generator.parameters()},
             {'params': [z], 'lr': self.lr_z}
@@ -432,13 +436,17 @@ class GlobalSynthesizer(ABC):
                 loss_adv = loss_oh.new_zeros(1)
             loss = self.bn * loss_bn + self.oh * loss_oh + self.adv * loss_adv
             with torch.no_grad():
-                if best_cost > loss.item() or best_inputs is None:
-                    best_cost = loss.item()
-                    best_inputs = inputs.data.cpu()  # mem, cpu
+                if best_cost is None:
+                    best_cost = loss.detach()
+                    best_inputs = inputs.detach()
+                else:
+                    improved = loss.detach() < best_cost
+                    best_cost = torch.where(improved, loss.detach(), best_cost)
+                    best_inputs = torch.where(improved, inputs.detach(), best_inputs)
                     # save_data = best_inputs.clone()
                     # vutils.save_image(save_data[:200], 'real_{}.png'.format(dataset), normalize=True, scale_each=True, nrow=20)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
             if self.ismaml:
@@ -458,6 +466,7 @@ class GlobalSynthesizer(ABC):
             reptile_grad(self.generator, fast_generator)
             self.meta_optimizer.step()
 
+        self.student.requires_grad_(True)
         self.student.train()
         self.prev_z = (z, targets)
         end = time.time()
@@ -560,12 +569,13 @@ class TARGET(BaseLearner):
         loader = self.get_all_syn_data()
         data_iter = DataIter(loader)
         for i in range(kd_steps):
-            images = data_iter.next().cuda()
-            with torch.no_grad():
-                t_out = teacher(images)["logits"]
-            s_out = student(images.detach())["logits"]
-            loss_s = criterion(s_out, t_out.detach())
-            optimizer.zero_grad()
+            images = self._prepare_images(data_iter.next())
+            with self._autocast():
+                with torch.no_grad():
+                    t_out = teacher(images)["logits"]
+                s_out = student(images.detach())["logits"]
+                loss_s = criterion(s_out, t_out.detach())
+            optimizer.zero_grad(set_to_none=True)
             loss_s.backward()
             optimizer.step()
 
@@ -576,7 +586,7 @@ class TARGET(BaseLearner):
 
         img_shape = (3, 32, 32) if self.args["dataset"] == "cifar100" else (3, 64, 64)
         if self.args["dataset"] == "imagenet100": img_shape = (3, 128, 128)  # (3, 224, 224)
-        generator = Generator(nz=nz, ngf=64, img_size=img_size, nc=3).cuda()
+        generator = self._prepare_model(Generator(nz=nz, ngf=64, img_size=img_size, nc=3))
         student = copy.deepcopy(self._network)
         student.apply(weight_init)
         tmp_dir = os.path.join(self.save_dir, "task_{}".format(self._cur_task))
@@ -601,9 +611,11 @@ class TARGET(BaseLearner):
             synthesizer.synthesize()  # generate synthetic data
             if it >= warmup:
                 self.kd_train(student, self._network, criterion, optimizer)  # kd_steps
-                test_acc = self._compute_accuracy(student, self.test_loader)
-                print("Task {}, Data Generation, Epoch {}/{} =>  Student test_acc: {:.2f}".format(
-                    self._cur_task, it + 1, syn_round, test_acc, ))
+                if ((it - warmup + 1) % self.args.get("synthesis_eval_interval", 1) == 0 or
+                        it + 1 == syn_round):
+                    test_acc = self._compute_accuracy(student, self.test_loader)
+                    print("Task {}, Data Generation, Epoch {}/{} =>  Student test_acc: {:.2f}".format(
+                        self._cur_task, it + 1, syn_round, test_acc, ))
                 scheduler.step()
                 # wandb.log({'Distill {}, accuracy'.format(self._cur_task): test_acc})
 
@@ -652,10 +664,8 @@ class TARGET(BaseLearner):
         test_dataset = data_manager.get_dataset(
             np.arange(0, self._total_classes), source="test", mode="test"
         )
-        self.test_loader = DataLoader(
-            test_dataset, batch_size=256, shuffle=False, num_workers=4
-        )
-        setup_seed(self.seed)
+        self.test_loader = self._test_data_loader(test_dataset)
+        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
         if self._cur_task == 0 and (not os.path.exists(self.save_dir)):
             os.makedirs(self.save_dir)
         if self._cur_task != 0:
@@ -672,11 +682,11 @@ class TARGET(BaseLearner):
         optimizer = torch.optim.SGD(model.parameters(), lr=self.args['local_lr'], momentum=0.9, weight_decay=5e-4)
         for iter in range(self.args["local_ep"]):
             for batch_idx, (_, images, labels) in enumerate(train_data_loader):
-                images, labels = images.cuda(), labels.cuda()
-                # print("%s - %s" % (images.shape, images.shape))
-                output = model(images)["logits"]
-                loss = F.cross_entropy(output, labels)
-                optimizer.zero_grad()
+                images, labels = self._prepare_images(images), labels.cuda(non_blocking=True)
+                with self._autocast():
+                    output = model(images)["logits"]
+                    loss = F.cross_entropy(output, labels)
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
             print("---task {}, ep {}/{} =>  CE: {}, F: {}".format(
@@ -695,25 +705,21 @@ class TARGET(BaseLearner):
             total_local = 0.0
             total_syn = 0.0
             for batch_idx, ((_, images, labels), syn_input) in iter_loader:
-                images, labels, syn_input = images.cuda(), labels.cuda(), syn_input.cuda()
-                # print("%s - %s" % (images.shape, syn_input.shape))
+                images = self._prepare_images(images)
+                labels = labels.cuda(non_blocking=True)
+                syn_input = self._prepare_images(syn_input)
                 fake_targets = labels - self._known_classes
-                output = model(images)["logits"]
-                # for new tasks
-                loss_ce = F.cross_entropy(output[:, self._known_classes:], fake_targets)
-                s_out = model(syn_input)["logits"]
-                with torch.no_grad():
-                    t_out = teacher(syn_input.detach())["logits"]
-                    total_syn += syn_input.shape[0]
-                    total_local += images.shape[0]
-                # for old task
-                loss_kd = _KD_loss(
-                    s_out[:, : self._known_classes],  # logits on previous tasks
-                    t_out.detach(),
-                    2,
-                )
-                loss = loss_ce + self.args["kd"] * loss_kd
-                optimizer.zero_grad()
+                with self._autocast():
+                    output = model(images)["logits"]
+                    loss_ce = F.cross_entropy(output[:, self._known_classes:], fake_targets)
+                    s_out = model(syn_input)["logits"]
+                    with torch.no_grad():
+                        t_out = teacher(syn_input.detach())["logits"]
+                        total_syn += syn_input.shape[0]
+                        total_local += images.shape[0]
+                    loss_kd = _KD_loss(s_out[:, : self._known_classes], t_out.detach(), 2)
+                    loss = loss_ce + self.args["kd"] * loss_kd
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
             print("---task {}, ep {}/{} =>  CE: {}, F: {}".format(
@@ -722,39 +728,40 @@ class TARGET(BaseLearner):
         return model.state_dict(), total_syn, total_local
 
     def _fl_train(self, train_dataset, test_loader):
-        self._network.cuda()
+        self._prepare_model(self._network)
         user_groups, _ = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
         prog_bar = tqdm(range(self.args["com_round"]))
+        local_loaders = self._client_loaders(train_dataset, user_groups)
+        client_model = copy.deepcopy(self._network)
         for _, com in enumerate(prog_bar):
             local_weights = []
             idxs_users = range(self.args["num_users"])
             for idx in idxs_users:
-                local_train_loader = DataLoader(DatasetSplit(train_dataset, user_groups[idx]),
-                                                batch_size=self.args["local_bs"], shuffle=True, num_workers=4)
+                client_model.load_state_dict(self._network.state_dict())
+                local_train_loader = local_loaders[idx]
                 if self._cur_task == 0:
-                    w = self._local_update(copy.deepcopy(self._network), local_train_loader)
+                    w = self._local_update(client_model, local_train_loader)
                 else:
-                    w, total_syn, total_local = self._local_finetune(self._old_network, copy.deepcopy(self._network),
+                    w, total_syn, total_local = self._local_finetune(self._old_network, client_model,
                                                                      local_train_loader, self._cur_task, idx)
                     if com == 0 and self._cur_task == 1:
                         print("\t \t client {}, local dataset size:{},  syntheic data size:{}".format(idx, total_local,
                                                                                                       total_syn))
 
-                local_weights.append(copy.deepcopy(w))
-                del local_train_loader, w
-                torch.cuda.empty_cache()
+                local_weights.append({key: value.detach().clone() for key, value in w.items()})
 
                 # update global weights
             global_weights = average_weights(local_weights)
             self._network.load_state_dict(global_weights)
 
-            if com % 1 == 0:
+            if self._should_evaluate(com):
                 test_acc = self._compute_accuracy(self._network, test_loader)
                 info = ("Task {}, Epoch {}/{} =>  Test_accy {:.2f}".format(
                     self._cur_task, com + 1, self.args["com_round"], test_acc, ))
                 prog_bar.set_description(info)
                 if self.wandb == 1:
                     wandb.log({'Task_{}, accuracy'.format(self._cur_task): test_acc})
+        del client_model, local_loaders
 
 
 def _KD_loss(pred, soft, T):

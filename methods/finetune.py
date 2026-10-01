@@ -101,10 +101,8 @@ class Finetune(BaseLearner):
         test_dataset = data_manager.get_dataset(
             np.arange(0, self._total_classes), source="test", mode="test"
         )
-        self.test_loader = DataLoader(
-            test_dataset, batch_size=256, shuffle=False, num_workers=4
-        )
-        setup_seed(self.seed)
+        self.test_loader = self._test_data_loader(test_dataset)
+        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
         self._fl_train(train_dataset, self.test_loader)
         
 
@@ -153,10 +151,11 @@ class Finetune(BaseLearner):
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
         for iter in range(self.args["local_ep"]):
             for batch_idx, (_, images, labels) in enumerate(train_data_loader):
-                images, labels = images.cuda(), labels.cuda()
-                output = model(images)["logits"]
-                loss = F.cross_entropy(output, labels)
-                optimizer.zero_grad()
+                images, labels = self._prepare_images(images), labels.cuda(non_blocking=True)
+                with self._autocast():
+                    output = model(images)["logits"]
+                    loss = F.cross_entropy(output, labels)
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
         return model.state_dict()
@@ -168,9 +167,9 @@ class Finetune(BaseLearner):
         all_targets = []
         with torch.no_grad():
             for i, (_, input, target) in enumerate(val_loader):
-                input, target = input.cuda(), target.cuda()
-                # compute output
-                output = model(input)["logits"]
+                input, target = self._prepare_images(input), target.cuda(non_blocking=True)
+                with self._autocast():
+                    output = model(input)["logits"]
                 _, pred = torch.max(output, 1)
                 all_preds.extend(pred.cpu().numpy())
                 all_targets.extend(target.cpu().numpy())
@@ -194,12 +193,12 @@ class Finetune(BaseLearner):
         # print_data_stats(0, train_data_loader)
         for iter in range(self.args["local_ep"]):
             for batch_idx, (_, images, labels) in enumerate(train_data_loader):
-                images, labels = images.cuda(), labels.cuda()
+                images, labels = self._prepare_images(images), labels.cuda(non_blocking=True)
                 fake_targets = labels - self._known_classes
-                output = model(images)["logits"]
-                #* finetune on the new tasks
-                loss = F.cross_entropy(output[:, self._known_classes :], fake_targets)
-                optimizer.zero_grad()
+                with self._autocast():
+                    output = model(images)["logits"]
+                    loss = F.cross_entropy(output[:, self._known_classes :], fake_targets)
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
             # self.per_cls_acc(self.test_loader, model)
@@ -207,28 +206,29 @@ class Finetune(BaseLearner):
         return model.state_dict()
 
     def _fl_train(self, train_dataset, test_loader):
-        self._network.cuda()
+        self._prepare_model(self._network)
         cls_acc_list = []
-        user_groups = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
+        user_groups, _ = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
         prog_bar = tqdm(range(self.args["com_round"]))
+        local_loaders = self._client_loaders(train_dataset, user_groups)
+        client_model = copy.deepcopy(self._network)
         for _, com in enumerate(prog_bar):
             local_weights = []
             idxs_users = range(self.args["num_users"])
             for idx in idxs_users:
-                local_train_loader = DataLoader(DatasetSplit(train_dataset, user_groups[idx]), 
-                    batch_size=self.args["local_bs"], shuffle=True, num_workers=4)
+                client_model.load_state_dict(self._network.state_dict())
+                local_train_loader = local_loaders[idx]
                 if self._cur_task == 0:
-                    w = self._local_update(copy.deepcopy(self._network), local_train_loader)
+                    w = self._local_update(client_model, local_train_loader)
                 else:
-                    w = self._local_finetune(copy.deepcopy(self._network), local_train_loader)
-                local_weights.append(copy.deepcopy(w))
+                    w = self._local_finetune(client_model, local_train_loader)
+                local_weights.append({key: value.detach().clone() for key, value in w.items()})
             # update global weights
             global_weights = average_weights(local_weights)
             self._network.load_state_dict(global_weights)
-            if com % 1 == 0:
-                cls_acc = self.per_cls_acc(self.test_loader, self._network)
-                cls_acc_list.append(cls_acc)
-
+            cls_acc = self.per_cls_acc(self.test_loader, self._network)
+            cls_acc_list.append(cls_acc)
+            if self._should_evaluate(com):
                 test_acc = self._compute_accuracy(self._network, test_loader)
                 info=("Task {}, Epoch {}/{} =>  Test_accy {:.2f}".format(
                     self._cur_task, com + 1, self.args["com_round"], test_acc,))
@@ -241,6 +241,7 @@ class Finetune(BaseLearner):
             acc_max = self.per_cls_acc(self.test_loader, self._network)
         print("For task: {}, acc list max: {}".format(self._cur_task, acc_max))
         self.acc.append(acc_max)
+        del client_model, local_loaders
 
 
 

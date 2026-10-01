@@ -1,5 +1,6 @@
 import argparse
 import os
+import torch
 try:
     import wandb
 except ImportError:
@@ -53,7 +54,10 @@ def get_learner(model_name, args):
 
 
 def train(args):
-    setup_seed(args["seed"])
+    setup_seed(args["seed"], fast_cuda=args["fast_cuda"])
+    if args["fast_cuda"]:
+        if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+            raise RuntimeError("--fast_cuda requires a CUDA GPU with BF16 support")
     # setup the dataset and labels
     data_manager = DataManager(
         args["dataset"],
@@ -92,6 +96,8 @@ def args_parser():
     parser.add_argument('--seed', type=int, default=2023, help='random seed')
     parser.add_argument('--spec', type=str, default="t1", help='choose a model')
     parser.add_argument('--gpu', default=0, type=int, help='GPU id to use.')
+    parser.add_argument('--fast_cuda', action='store_true',
+                        help='enable B200 CUDA optimizations across all learners')
 
     # federated continual learning settings
     parser.add_argument('--dataset', type=str, default="cifar100", help='which dataset')
@@ -99,6 +105,8 @@ def args_parser():
     parser.add_argument('--method', type=str, default="lander", help='choose a learner')
     parser.add_argument('--net', type=str, default="resnet18", help='choose a model')
     parser.add_argument('--com_round', type=int, default=100, help='communication rounds')
+    parser.add_argument('--eval_interval', type=int, default=1,
+                        help='evaluate every N communication rounds, and at the final round')
     parser.add_argument('--local_ep', type=int, default=2, help='local training epochs')
     parser.add_argument('--num_users', type=int, default=5, help='num of clients')
     parser.add_argument('--local_bs', type=int, default=128, help='local batch size')
@@ -117,6 +125,10 @@ def args_parser():
     parser.add_argument('--warmup', default=10, type=int, help='number of epoches generator only warmups not stores images')
     parser.add_argument('--syn_round', default=40, type=int, help='number of synthetize round.')
     parser.add_argument('--g_steps', default=40, type=int, help='number of generation steps.')
+    parser.add_argument('--synthesis_log_interval', default=10, type=int,
+                        help='print one synthesis loss line every N steps')
+    parser.add_argument('--synthesis_eval_interval', default=1, type=int,
+                        help='evaluate generated student/teacher every N synthesis rounds')
 
     # Client Training
     parser.add_argument('--num_worker', type=int, default=4, help='number of worker for dataloader')
@@ -124,6 +136,8 @@ def args_parser():
     parser.add_argument('--weight_decay', default=1e-5, type=float, help='weight decay for optimizer')
     parser.add_argument('--syn_bs', default=1, type=int, help='number of old synthetic data in training, 1 for similar to local_bs')
     parser.add_argument('--local_lr', default=4e-2, type=float, help='learning rate for optimizer')
+    parser.add_argument('--kd', default=1.0, type=float,
+                        help='TARGET local distillation loss weight')
 
     # LANDER
     parser.add_argument('--r', default=0.015, type=float, help='LTE center radius')
@@ -183,6 +197,12 @@ def args_parser():
     args = parser.parse_args()
     if args.repeat_rate < 1:
         parser.error('--repeat_rate must be a positive integer')
+    if args.synthesis_log_interval < 1:
+        parser.error('--synthesis_log_interval must be a positive integer')
+    if args.eval_interval < 1:
+        parser.error('--eval_interval must be a positive integer')
+    if args.synthesis_eval_interval < 1:
+        parser.error('--synthesis_eval_interval must be a positive integer')
 
     return args
 

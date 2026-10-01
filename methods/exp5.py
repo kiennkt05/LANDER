@@ -244,11 +244,9 @@ class Exp5Base(BaseLearner):
             source="test",
             mode="test",
         )
-        self.test_loader = DataLoader(
-            test_dataset, batch_size=256, shuffle=False, num_workers=4
-        )
+        self.test_loader = self._test_data_loader(test_dataset)
 
-        setup_seed(self.seed)
+        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
         partition_res = partition_data(
             train_dataset.labels, beta=self.args["beta"], n_parties=self.num_users
         )
@@ -293,7 +291,7 @@ class Exp5Base(BaseLearner):
         self.trajectory_matrix = torch.zeros((N, D), dtype=torch.float32)
 
         # 3. Federated Training with exact trajectory accumulation
-        self._network.cuda()
+        self._prepare_model(self._network)
         self._fl_train(train_dataset, user_groups, offsets, D)
 
         # 4. Trajectory projection into rank-r subspace (implemented by subclasses)
@@ -357,7 +355,7 @@ class Exp5Base(BaseLearner):
             for k in idxs_users:
                 local_model = copy.deepcopy(self._network)
                 local_model.train()
-                local_model.cuda()
+                self._prepare_model(local_model)
 
                 Nk = len(user_groups[k])
                 cand_ids = np.arange(offsets[k], offsets[k] + Nk)
@@ -367,7 +365,8 @@ class Exp5Base(BaseLearner):
                 )
 
                 local_loader = DataLoader(
-                    client_ds, batch_size=local_bs, shuffle=True, num_workers=4
+                    client_ds, batch_size=local_bs, shuffle=True,
+                    num_workers=self.args["num_worker"], pin_memory=True
                 )
 
                 optimizer = torch.optim.SGD(
@@ -390,8 +389,9 @@ class Exp5Base(BaseLearner):
                         # Exact momentum multiplier: W_s = (1 - mu^(S - s + 1)) / (1 - mu)
                         W_s = (1.0 - (momentum ** (S - step + 1))) / (1.0 - momentum)
 
-                        images = images.cuda()
-                        labels = labels.cuda()
+                        # Keep exact trajectory derivatives in FP32 for the invariant gate.
+                        images = self._prepare_images(images)
+                        labels = labels.cuda(non_blocking=True)
 
                         # Capture head parameters before update step for weight decay attribution
                         theta_head = torch.cat([
@@ -446,14 +446,13 @@ class Exp5Base(BaseLearner):
                         round_delta_rep += step_coeff * g_rep_sum
                         round_delta_wd += (step_coeff * weight_decay) * theta_head
 
-                        optimizer.zero_grad()
+                        optimizer.zero_grad(set_to_none=True)
                         loss.backward()
                         optimizer.step()
 
                 local_weights.append(copy.deepcopy(local_model.state_dict()))
                 loss_weight.append(client_loss)
                 del local_loader, local_model
-                torch.cuda.empty_cache()
 
             # FedAvg aggregation
             global_weights = average_weights(local_weights)
@@ -481,7 +480,7 @@ class Exp5Base(BaseLearner):
             task_pred_delta_theta += pred_delta_a
             task_actual_delta_theta += actual_delta_a
 
-            if (com + 1) % 1 == 0 or com == com_round - 1:
+            if self._should_evaluate(com):
                 test_acc = self._compute_accuracy(self._network, self.test_loader)
                 info = f"Task {self._cur_task}, Round {com + 1}/{com_round} => Test_accy {test_acc:.2f} | E_a: {err_a:.2e}"
                 prog_bar.set_description(info)
@@ -513,7 +512,6 @@ class Exp5Base(BaseLearner):
 
         self._network.load_state_dict(self.best_model)  # Best model using the lowest training loss
         del self.best_model
-        torch.cuda.empty_cache()
 
     def _training_loss(self, logits, labels, is_cur, batch_indices, client_ds):
         """Select CE, FedCBDR repo_dual TTS, or all-sample CE plus replay logit MSE."""
@@ -551,7 +549,7 @@ class Exp5Base(BaseLearner):
                 loader = DataLoader(ds, batch_size=self.args["local_bs"], shuffle=False,
                                     num_workers=self.args.get("num_worker", 4))
                 for indices, images, _ in loader:
-                    ds.logits[indices] = model(images.to(device))["logits"].detach().float().cpu()
+                    ds.logits[indices] = model(self._prepare_images(images))["logits"].detach().float().cpu()
         finally:
             model.train(was_training)
 
@@ -1109,7 +1107,8 @@ class Exp5aLocal(Exp5Base):
             rk = min(r_target, Nk, D)
             qk = min(rk + p, Nk, D)
 
-            setup_seed(self.seed + self._cur_task * 1000 + k)
+            setup_seed(self.seed + self._cur_task * 1000 + k,
+                       fast_cuda=self.args.get("fast_cuda", False))
             # Uncentered randomized PCA: X_k \approx U_k \Sigma_k V_k^T
             U, S, V = torch.pca_lowrank(X_k, q=qk, center=False)
             R_k = V[:, :rk]
@@ -1171,7 +1170,8 @@ class Exp5aGlobal(Exp5Base):
         r_glob = min(r_target, N, D)
         q = min(r_glob + p, N, D)
 
-        setup_seed(self.seed + self._cur_task * 1000)
+        setup_seed(self.seed + self._cur_task * 1000,
+                   fast_cuda=self.args.get("fast_cuda", False))
         U_prime, S_prime, V_prime = torch.pca_lowrank(X_prime, q=q, center=False)
         R_prime_r = V_prime[:, :r_glob]
 

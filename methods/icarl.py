@@ -46,12 +46,12 @@ class iCaRL(BaseLearner):
             source="train",
             mode="train",
         )
-        setup_seed(self.seed)
-        user_groups = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
+        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
+        user_groups, _ = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
         all_previous_dataset = DatasetSplit(train_dataset, user_groups[idx])
         # for third task
         for i in range(2, self._cur_task + 1):  # 2-4
-            setup_seed(self.seed)
+            setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
             bgn_cls += self.each_task  # 20-40
             end_cls += self.each_task
             train_dataset_next = data_manager.get_dataset(
@@ -59,7 +59,7 @@ class iCaRL(BaseLearner):
                 source="train",
                 mode="train",
             )
-            user_groups_next = partition_data(train_dataset_next.labels, beta=self.args["beta"],
+            user_groups_next, _ = partition_data(train_dataset_next.labels, beta=self.args["beta"],
                                               n_parties=self.args["num_users"])
             tmp_dataset = DatasetSplit(train_dataset_next, user_groups_next[idx])  # <utils.data_manager.DummyDataset>
             all_previous_dataset = self.combine_dataset(all_previous_dataset, tmp_dataset, 0)  # combine two datasets
@@ -83,11 +83,9 @@ class iCaRL(BaseLearner):
         test_dataset = data_manager.get_dataset(
             np.arange(0, self._total_classes), source="test", mode="test"
         )
-        self.test_loader = DataLoader(
-            test_dataset, batch_size=256, shuffle=False, num_workers=4
-        )
-        self._network.cuda()
-        setup_seed(self.seed)
+        self.test_loader = self._test_data_loader(test_dataset)
+        self._prepare_model(self._network)
+        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
         self._fl_train(train_dataset, self.test_loader, data_manager)
 
     def _local_update(self, model, train_data_loader, client_id, tmp, com_id):
@@ -96,10 +94,11 @@ class iCaRL(BaseLearner):
         for iter in range(self.args["local_ep"]):
             total = 0
             for batch_idx, (_, images, labels) in enumerate(train_data_loader):
-                images, labels = images.cuda(), labels.cuda()
-                output = model(images)["logits"]
-                loss = F.cross_entropy(output, labels)
-                optimizer.zero_grad()
+                images, labels = self._prepare_images(images), labels.cuda(non_blocking=True)
+                with self._autocast():
+                    output = model(images)["logits"]
+                    loss = F.cross_entropy(output, labels)
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
                 total += images.shape[0]
@@ -115,20 +114,17 @@ class iCaRL(BaseLearner):
         for iter in range(self.args["local_ep"]):
             total = 0
             for batch_idx, (_, images, labels) in enumerate(train_data_loader):
-                images, labels = images.cuda(), labels.cuda()
+                images, labels = self._prepare_images(images), labels.cuda(non_blocking=True)
                 # fake_targets = labels - self._known_classes
-                output = model(images)["logits"]
-                # * finetune on the new tasks
-                loss_clf = F.cross_entropy(output, labels)
-                loss_kd = _KD_loss(
-                    output[:, : self._known_classes],
-                    self._old_network(images)["logits"],
-                    T,
-                )
+                with self._autocast():
+                    output = model(images)["logits"]
+                    loss_clf = F.cross_entropy(output, labels)
+                    with torch.no_grad():
+                        old_logits = self._old_network(images)["logits"]
+                    loss_kd = _KD_loss(output[:, : self._known_classes], old_logits, T)
+                    loss = loss_clf + loss_kd
 
-                loss = loss_clf + loss_kd
-
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
                 total += images.shape[0]
@@ -138,10 +134,11 @@ class iCaRL(BaseLearner):
         return model.state_dict()
 
     def _fl_train(self, train_dataset, test_loader, data_manager):
-        self._network.cuda()
+        self._prepare_model(self._network)
 
-        user_groups = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
+        user_groups, _ = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
         prog_bar = tqdm(range(self.args["com_round"]))
+        client_model = copy.deepcopy(self._network)
 
         for _, com in enumerate(prog_bar):
             local_weights = []
@@ -160,25 +157,27 @@ class iCaRL(BaseLearner):
                     local_dataset = DatasetSplit(local_dataset, range(local_dataset.labels.shape[0]))
 
                 local_train_loader = DataLoader(local_dataset, batch_size=self.args["local_bs"], shuffle=True,
-                                                num_workers=4)
+                                                num_workers=self.args["num_worker"], pin_memory=True)
                 tmp = print_data_stats(idx, local_train_loader)
                 if com != 0:
                     tmp = ""
+                client_model.load_state_dict(self._network.state_dict())
                 if self._cur_task == 0:
-                    w = self._local_update(copy.deepcopy(self._network), local_train_loader, idx, tmp, com)
+                    w = self._local_update(client_model, local_train_loader, idx, tmp, com)
                 else:
-                    w = self._local_finetune(copy.deepcopy(self._network), local_train_loader, idx, tmp, com)
-                local_weights.append(copy.deepcopy(w))
+                    w = self._local_finetune(client_model, local_train_loader, idx, tmp, com)
+                local_weights.append({key: value.detach().clone() for key, value in w.items()})
             # update global weights
             global_weights = average_weights(local_weights)
             self._network.load_state_dict(global_weights)
-            if com % 1 == 0:
+            if self._should_evaluate(com):
                 test_acc = self._compute_accuracy(self._network, test_loader)
                 info = ("Task {}, Epoch {}/{} =>  Test_accy {:.2f}".format(
                     self._cur_task, com + 1, self.args["com_round"], test_acc, ))
                 prog_bar.set_description(info)
                 if self.wandb == 1:
                     wandb.log({'Task_{}, accuracy'.format(self._cur_task): test_acc})
+        del client_model
 
 
 def _KD_loss(pred, soft, T):

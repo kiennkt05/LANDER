@@ -726,7 +726,7 @@ class FedCBDR(BaseLearner):
         self._network.update_fc(self._total_classes)
         self.task_registry.append(self._cur_task, self._known_classes, self._total_classes)
         self.probes.add_classes(data_manager, range(self._known_classes, self._total_classes))
-        self._network.cuda()
+        self._prepare_model(self._network)
         print(
             "Learning on {}-{}".format(
                 self._known_classes,
@@ -750,8 +750,9 @@ class FedCBDR(BaseLearner):
             batch_size=256,
             shuffle=False,
             num_workers=self.args["num_worker"],
-            multiprocessing_context=self.args["mulc"],
-            persistent_workers=True,
+            pin_memory=True,
+            multiprocessing_context=self.args["mulc"] if self.args["num_worker"] > 0 else None,
+            persistent_workers=self.args["num_worker"] > 0,
         )
         print(self.test_loader)
 
@@ -766,8 +767,9 @@ class FedCBDR(BaseLearner):
                 batch_size=256,
                 shuffle=False,
                 num_workers=self.args["num_worker"],
-                multiprocessing_context=self.args["mulc"],
-                persistent_workers=True,
+                pin_memory=True,
+                multiprocessing_context=self.args["mulc"] if self.args["num_worker"] > 0 else None,
+                persistent_workers=self.args["num_worker"] > 0,
             )
 
             new_dataset = data_manager.get_dataset(
@@ -780,11 +782,12 @@ class FedCBDR(BaseLearner):
                 batch_size=256,
                 shuffle=False,
                 num_workers=self.args["num_worker"],
-                multiprocessing_context=self.args["mulc"],
-                persistent_workers=True,
+                pin_memory=True,
+                multiprocessing_context=self.args["mulc"] if self.args["num_worker"] > 0 else None,
+                persistent_workers=self.args["num_worker"] > 0,
             )
 
-        setup_seed(self.seed)
+        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
         self._fl_train(self.train_dataset, self.test_loader)
 
     def _selected_clients(self):
@@ -858,12 +861,12 @@ class FedCBDR(BaseLearner):
             shuffle=True,
             num_workers=self.args["num_worker"],
             pin_memory=True,
-            multiprocessing_context=self.args["mulc"],
-            persistent_workers=True,
+            multiprocessing_context=self.args["mulc"] if self.args["num_worker"] > 0 else None,
+            persistent_workers=self.args["num_worker"] > 0,
         )
 
     def _fl_train(self, train_dataset, test_loader):
-        self._network.cuda()
+        self._prepare_model(self._network)
         self.best_model = None  # Best model using the lowest training loss
         self.lowest_loss = np.inf
 
@@ -893,6 +896,11 @@ class FedCBDR(BaseLearner):
         )
 
         prog_bar = tqdm(range(self.args["com_round"]))
+        client_loaders = {
+            idx: self._make_client_loader(idx)
+            for idx in range(self.args["num_users"])
+        }
+        client_model = copy.deepcopy(self._network)
 
         for _, com in enumerate(prog_bar):
             local_weights = []
@@ -906,34 +914,30 @@ class FedCBDR(BaseLearner):
             lr = self._learning_rate(com)
 
             for idx in idxs_users:
-                local_train_loader = self._make_client_loader(int(idx))
+                client_model.load_state_dict(self._network.state_dict())
+                local_train_loader = client_loaders[int(idx)]
 
                 if self._cur_task == 0:
                     w, total_loss = self._local_update(
-                        copy.deepcopy(self._network),
+                        client_model,
                         local_train_loader,
                         lr,
                     )
                 else:
                     w, total_loss = self._local_finetune(
-                        copy.deepcopy(self._network),
+                        client_model,
                         local_train_loader,
                         lr,
                     )
 
-                local_weights.append(copy.deepcopy(w))
+                local_weights.append({key: value.detach().clone() for key, value in w.items()})
                 loss_weight.append(total_loss)
                 if self.metrics:
-                    probe_model = copy.deepcopy(self._network)
-                    probe_model.load_state_dict(w)
-                    local_accuracy[int(idx)] = self._probe_accuracy(probe_model)
-                    del probe_model
-
-                del local_train_loader, w
-                torch.cuda.empty_cache()
+                    local_accuracy[int(idx)] = self._probe_accuracy(client_model)
 
             global_weights = uniform_average_state_dicts(local_weights)
             self._network.load_state_dict(global_weights)
+            del local_weights, global_weights
             if self.metrics:
                 self._log_probe(com)
                 self.metrics.write("fedavg", self._cur_task, com, before=before,
@@ -948,7 +952,7 @@ class FedCBDR(BaseLearner):
                 self.lowest_loss = sum_loss
                 self.best_model = copy.deepcopy(self._network.state_dict())
 
-            if com % 1 == 0 and com < self.args["com_round"]:
+            if self._should_evaluate(com):
                 test_acc = self._compute_fedcbdr_accuracy(
                     self._network,
                     test_loader,
@@ -956,11 +960,11 @@ class FedCBDR(BaseLearner):
 
                 if self._cur_task > 0:
                     test_old_acc = self._compute_fedcbdr_accuracy(
-                        copy.deepcopy(self._network),
+                        self._network,
                         self.old_loader,
                     )
                     test_new_acc = self._compute_fedcbdr_accuracy(
-                        copy.deepcopy(self._network),
+                        self._network,
                         self.new_loader,
                     )
                     print(
@@ -1009,7 +1013,7 @@ class FedCBDR(BaseLearner):
 
         self._network.load_state_dict(self.best_model)  # Best model using the lowest training loss
         del self.best_model
-        torch.cuda.empty_cache()
+        del client_model, client_loaders
 
         if self.metrics:
             self._log_probe("selected")
@@ -1040,24 +1044,26 @@ class FedCBDR(BaseLearner):
                 _,
                 _,
             ) in enumerate(train_data_loader):
-                images = images.cuda()
-                labels = labels.cuda()
+                images = self._prepare_images(images)
+                labels = labels.cuda(non_blocking=True)
 
-                output = model(images)["logits"]
-                sample_ce = F.cross_entropy(output, labels, reduction="none")
-                loss = sample_ce.mean()
+                with self._autocast():
+                    output = model(images)["logits"]
+                    sample_ce = F.cross_entropy(output, labels, reduction="none")
+                    loss = sample_ce.mean()
                 self._record_mass(labels, torch.zeros_like(labels, dtype=torch.bool), sample_ce)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
-                losses.append(float(loss.detach().cpu()))
+                losses.append(loss.detach())
 
-        total_loss = float(np.mean(losses)) if losses else 0.0
+        loss_values = torch.stack(losses).float().cpu().numpy() if losses else np.array([])
+        total_loss = float(np.mean(loss_values)) if losses else 0.0
         print(
             "---task {} => CE: {}, T: {}".format(
                 self._cur_task,
-                losses[-1] if losses else 0.0,
+                float(loss_values[-1]) if losses else 0.0,
                 total_loss,
             )
         )
@@ -1083,6 +1089,7 @@ class FedCBDR(BaseLearner):
         )
 
         losses = []
+        loss_values = np.array([])
         for local_epoch in range(self.args["local_ep"]):
             for batch_idx, (
                 _,
@@ -1092,36 +1099,38 @@ class FedCBDR(BaseLearner):
                 replay_weights,
                 task_ids,
             ) in enumerate(train_data_loader):
-                images = images.cuda()
-                labels = labels.cuda()
-                is_replay = is_replay.cuda()
-                replay_weights = replay_weights.cuda()
+                images = self._prepare_images(images)
+                labels = labels.cuda(non_blocking=True)
+                is_replay = is_replay.cuda(non_blocking=True)
+                replay_weights = replay_weights.cuda(non_blocking=True)
 
-                logits = model(images)["logits"]
-                loss = criterion(
-                    logits,
-                    labels,
-                    is_replay,
-                    replay_weights,
-                )
+                with self._autocast():
+                    logits = model(images)["logits"]
+                    loss = criterion(
+                        logits,
+                        labels,
+                        is_replay,
+                        replay_weights,
+                    )
                 self._record_mass(labels, is_replay, criterion.last_sample_ce)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
-                losses.append(float(loss.detach().cpu()))
+                losses.append(loss.detach())
 
+            loss_values = torch.stack(losses).float().cpu().numpy() if losses else np.array([])
             print(
                 "---task {}, ep {}/{} => TTS: {}, T: {}".format(
                     self._cur_task,
                     local_epoch + 1,
                     self.args["local_ep"],
-                    losses[-1] if losses else 0.0,
-                    float(np.mean(losses)) if losses else 0.0,
+                    float(loss_values[-1]) if losses else 0.0,
+                    float(np.mean(loss_values)) if losses else 0.0,
                 )
             )
 
-        total_loss = float(np.mean(losses)) if losses else 0.0
+        total_loss = float(np.mean(loss_values)) if losses else 0.0
         return model.state_dict(), total_loss
 
     def _record_mass(self, labels, replay, losses):
@@ -1191,8 +1200,8 @@ class FedCBDR(BaseLearner):
             shuffle=False,
             num_workers=self.args["num_worker"],
             pin_memory=True,
-            multiprocessing_context=self.args["mulc"],
-            persistent_workers=True,
+            multiprocessing_context=self.args["mulc"] if self.args["num_worker"] > 0 else None,
+            persistent_workers=self.args["num_worker"] > 0,
         )
 
         self._network.eval()
@@ -1200,7 +1209,8 @@ class FedCBDR(BaseLearner):
 
         with torch.no_grad():
             for _, images, _ in local_loader:
-                output = self._network(images.cuda())
+                # GDR feature geometry and downstream SVD remain in FP32.
+                output = self._network(self._prepare_images(images))
                 features.append(
                     self._extract_feature_tensor(output).detach().cpu()
                 )

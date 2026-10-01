@@ -10,13 +10,14 @@ import numpy as np
 import torch.backends.cudnn as cudnn
 
 
-def setup_seed(seed):
+def setup_seed(seed, fast_cuda=False):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-    cudnn.deterministic = True
+    cudnn.deterministic = not fast_cuda
+    cudnn.benchmark = bool(fast_cuda)
 
 
 def average_weights(w):
