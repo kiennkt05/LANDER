@@ -15,6 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from methods.fedcbdr import FedCBDR, ReplayDataset
+from utils.data_manager import setup_seed
 from utils.fedcbdr_interactions import replacement_slots
 from utils.metrics_logger import MetricsLogger
 from utils.task_registry import TaskRegistry
@@ -36,12 +37,29 @@ def load_snapshot(path):
 
 
 def restore_rng(state):
+    # The main entry point calls setup_seed before every task. Besides RNGs it
+    # configures cuDNN's algorithm selection; restoring RNG tensors alone
+    # leaves a fresh ablation process with different convolution behavior.
+    args = state["args"]
+    setup_seed(int(args["seed"]), fast_cuda=bool(args.get("fast_cuda", False)))
+    backends = state.get("torch_backend_state", {})
+    if "deterministic_algorithms" in backends:
+        torch.use_deterministic_algorithms(backends["deterministic_algorithms"])
+    if "float32_matmul_precision" in backends:
+        torch.set_float32_matmul_precision(backends["float32_matmul_precision"])
+    for name in ("deterministic", "benchmark", "enabled", "allow_tf32"):
+        if name in backends:
+            setattr(torch.backends.cudnn, name, backends[name])
+    if "cuda_matmul_allow_tf32" in backends:
+        torch.backends.cuda.matmul.allow_tf32 = backends["cuda_matmul_allow_tf32"]
     random.setstate(state["python_rng"])
     np.random.set_state(state["numpy_rng"])
     torch.random.set_rng_state(state["torch_rng"])
     if state["cuda_rng"]:
         if not torch.cuda.is_available():
             raise RuntimeError("snapshot has CUDA RNG state but CUDA is unavailable")
+        if len(state["cuda_rng"]) != torch.cuda.device_count():
+            raise RuntimeError("CUDA device visibility differs from the transition snapshot")
         torch.cuda.set_rng_state_all(state["cuda_rng"])
 
 

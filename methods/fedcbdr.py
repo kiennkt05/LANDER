@@ -1292,6 +1292,15 @@ class FedCBDR(BaseLearner):
             python_rng=random.getstate(), numpy_rng=np.random.get_state(),
             torch_rng=torch.random.get_rng_state(),
             cuda_rng=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            torch_backend_state=dict(
+                deterministic=torch.backends.cudnn.deterministic,
+                benchmark=torch.backends.cudnn.benchmark,
+                enabled=torch.backends.cudnn.enabled,
+                allow_tf32=torch.backends.cudnn.allow_tf32,
+                cuda_matmul_allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+                float32_matmul_precision=torch.get_float32_matmul_precision(),
+                deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
+            ),
             metrics_previous=copy.deepcopy(self.metrics.previous) if self.metrics else {},
             metrics_boundary=copy.deepcopy(self.metrics.boundary) if self.metrics else {},
             boundary_class_metrics=copy.deepcopy(self.metrics.boundary_class_metrics)

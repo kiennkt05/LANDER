@@ -15,7 +15,9 @@ classifier expansion and the actual client partition. Each snapshot contains
 the expanded model state, class order and task ranges, current training and
 test datasets, frozen probes, replay exemplars and weights, client partition,
 arguments, and Python/NumPy/Torch/CUDA RNG states. It also carries the prior
-selected-model boundary metrics and feature statistics. The experiment runner
+selected-model boundary metrics, feature statistics and Torch backend settings.
+For snapshots made before backend settings were saved, the runner reapplies
+`setup_seed` from the saved arguments before restoring RNG tensors. The experiment runner
 restores these states rather than repartitioning or rerunning GDR. It never
 continues the baseline sequence from an intervention model.
 

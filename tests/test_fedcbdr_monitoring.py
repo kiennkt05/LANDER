@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -112,6 +113,35 @@ class MonitoringTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             replacement_slots(duplicate_c, 0, 2, [(0, 0, 3)],
                               max_multiplicity=1)
+
+    def test_transition_restore_recovers_training_backend(self):
+        try:
+            from run_transition_ablation import restore_rng
+        except (ImportError, RuntimeError) as error:
+            self.skipTest("FedCBDR runtime dependencies unavailable: {}".format(error))
+        original = (torch.backends.cudnn.deterministic,
+                    torch.backends.cudnn.benchmark)
+        try:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            state = dict(args=dict(seed=2023, fast_cuda=False),
+                         python_rng=random.getstate(),
+                         numpy_rng=np.random.get_state(),
+                         torch_rng=torch.random.get_rng_state(), cuda_rng=[])
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
+            restore_rng(state)
+            self.assertTrue(torch.backends.cudnn.deterministic)
+            self.assertFalse(torch.backends.cudnn.benchmark)
+            self.assertTrue(torch.equal(torch.random.get_rng_state(), state["torch_rng"]))
+            state["torch_backend_state"] = dict(deterministic=True, benchmark=False)
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
+            restore_rng(state)
+            self.assertTrue(torch.backends.cudnn.deterministic)
+            self.assertFalse(torch.backends.cudnn.benchmark)
+        finally:
+            torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = original
 
 
 if __name__ == "__main__":

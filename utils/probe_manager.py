@@ -8,9 +8,9 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 
 @contextmanager
-def preserve_rng():
+def preserve_rng(devices=()):
     py_state, np_state = random.getstate(), np.random.get_state()
-    with torch.random.fork_rng():
+    with torch.random.fork_rng(devices=list(devices)):
         try:
             yield
         finally:
@@ -51,8 +51,10 @@ def extract_probe_outputs(model, loader, feature_extractor=None):
     modes = [(module, module.training) for module in model.modules()]
     logits, labels, features = [], [], []
     device = next(model.parameters()).device
+    devices = ([device.index if device.index is not None else torch.cuda.current_device()]
+               if device.type == "cuda" else [])
     try:
-        with preserve_rng(), torch.inference_mode():
+        with preserve_rng(devices), torch.inference_mode():
             model.eval()
             for _, images, target in loader:
                 output = model(images.to(device))
