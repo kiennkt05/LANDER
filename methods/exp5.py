@@ -246,7 +246,8 @@ class Exp5Base(BaseLearner):
         )
         self.test_loader = self._test_data_loader(test_dataset)
 
-        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
+        setup_seed(self.seed, fast_cuda=(self.args.get("fast_cuda", False) or
+                                        self.args.get("t4_parralel", False)))
         partition_res = partition_data(
             train_dataset.labels, beta=self.args["beta"], n_parties=self.num_users
         )
@@ -360,6 +361,7 @@ class Exp5Base(BaseLearner):
                 local_model = copy.deepcopy(self._network)
                 local_model.train()
                 self._prepare_model(local_model)
+                forward_model = self._training_model(local_model, ("logits", "features"))
 
                 Nk = len(user_groups[k])
                 cand_ids = np.arange(offsets[k], offsets[k] + Nk)
@@ -403,7 +405,7 @@ class Exp5Base(BaseLearner):
                             local_model.fc.bias.data.flatten()
                         ]).detach().cpu()
 
-                        outputs = local_model(images)
+                        outputs = forward_model(images)
                         features = outputs["features"]
                         logits = outputs["logits"]
 
@@ -456,7 +458,7 @@ class Exp5Base(BaseLearner):
 
                 local_weights.append(copy.deepcopy(local_model.state_dict()))
                 loss_weight.append(client_loss)
-                del local_loader, local_model
+                del local_loader, forward_model, local_model
 
             # FedAvg aggregation
             global_weights = average_weights(local_weights)
@@ -1113,7 +1115,8 @@ class Exp5aLocal(Exp5Base):
             qk = min(rk + p, Nk, D)
 
             setup_seed(self.seed + self._cur_task * 1000 + k,
-                       fast_cuda=self.args.get("fast_cuda", False))
+                       fast_cuda=(self.args.get("fast_cuda", False) or
+                                  self.args.get("t4_parralel", False)))
             # Uncentered randomized PCA: X_k \approx U_k \Sigma_k V_k^T
             U, S, V = torch.pca_lowrank(X_k, q=qk, center=False)
             R_k = V[:, :rk]
@@ -1176,7 +1179,8 @@ class Exp5aGlobal(Exp5Base):
         q = min(r_glob + p, N, D)
 
         setup_seed(self.seed + self._cur_task * 1000,
-                   fast_cuda=self.args.get("fast_cuda", False))
+                   fast_cuda=(self.args.get("fast_cuda", False) or
+                              self.args.get("t4_parralel", False)))
         U_prime, S_prime, V_prime = torch.pca_lowrank(X_prime, q=q, center=False)
         R_prime_r = V_prime[:, :r_glob]
 

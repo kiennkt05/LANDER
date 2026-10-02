@@ -597,7 +597,7 @@ class LANDER(BaseLearner):
         os.makedirs("store", exist_ok=True)
 
     def _training_images(self, images):
-        if self.args.get("fast_cuda", False):
+        if self.args.get("fast_cuda", False) or self.args.get("t4_parralel", False):
             return images.to(device="cuda", non_blocking=True,
                              memory_format=torch.channels_last)
         return images.cuda(non_blocking=True)
@@ -693,7 +693,7 @@ class LANDER(BaseLearner):
 
         self._network.update_fc(self._total_classes)
         self._network.cuda()
-        if self.args.get("fast_cuda", False):
+        if self.args.get("fast_cuda", False) or self.args.get("t4_parralel", False):
             self._network.to(memory_format=torch.channels_last)
         print("Learning on {}-{}".format(self._known_classes, self._total_classes))
 
@@ -733,7 +733,8 @@ class LANDER(BaseLearner):
                 persistent_workers=self.args["num_worker"] > 0
             )
 
-        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
+        setup_seed(self.seed, fast_cuda=(self.args.get("fast_cuda", False) or
+                                        self.args.get("t4_parralel", False)))
         if self._cur_task == 0 and (not os.path.exists(self.save_dir)):
             os.makedirs(self.save_dir)
         if self._cur_task != 0:
@@ -838,6 +839,8 @@ class LANDER(BaseLearner):
     def _local_update(self, model, train_data_loader, lr):
         print(lr)
         model.train()
+        forward_model = self._training_model(model, ("logits", "att"))
+        scaler = self._grad_scaler()
         total_loss = 0
         total_ce_loss = 0
         total_f_loss = 0
@@ -845,9 +848,8 @@ class LANDER(BaseLearner):
         for iter in range(self.args["local_ep"]):
             for batch_idx, (_, images, labels) in enumerate(train_data_loader):
                 images, labels = self._training_images(images), labels.cuda(non_blocking=True)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                                    enabled=self.args.get("fast_cuda", False)):
-                    output_list = model(images)
+                with self._autocast():
+                    output_list = forward_model(images)
                     output = output_list["logits"]
                     feature = output_list["att"]
                     target_f = self.label_emb[labels]
@@ -855,9 +857,7 @@ class LANDER(BaseLearner):
 
                     loss_ce = F.cross_entropy(output, labels)
                     loss = loss_ce + self.ltc * loss_f
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                self._optimizer_step(loss, optimizer, scaler)
                 if iter == 0:
                     total_loss += loss.detach()
                     total_ce_loss += loss_ce.detach()
@@ -874,6 +874,8 @@ class LANDER(BaseLearner):
 
         # global print_flag
         model.train()
+        forward_model = self._training_model(model, ("logits", "att"))
+        scaler = self._grad_scaler()
         teacher.eval()
         total_loss = 0
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=self.args['weight_decay'])
@@ -895,16 +897,15 @@ class LANDER(BaseLearner):
                 syn_input = syn_data_iter.next()
                 syn_input = self._training_images(syn_input)
                 fake_targets = labels - self._known_classes
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                                    enabled=self.args.get("fast_cuda", False)):
-                    c_output_list = model(images)
+                with self._autocast():
+                    c_output_list = forward_model(images)
                     c_output = c_output_list["logits"]
                     c_feature = c_output_list["att"]
                     c_target_f = self.label_emb[labels]
                     c_loss_f = torch.relu(torch.nn.functional.mse_loss(c_feature, c_target_f.detach()) - self.r)
 
                     loss_ce_cur = F.cross_entropy(c_output[:, self._known_classes:], fake_targets)
-                    s_out_list = model(syn_input.detach())
+                    s_out_list = forward_model(syn_input.detach())
                     s_out = s_out_list["logits"]
                     s_f = s_out_list["att"]
 
@@ -915,14 +916,12 @@ class LANDER(BaseLearner):
                         total_syn += syn_input.shape[0]
                         total_local += images.shape[0]
                     loss_kd = _KD_loss(
-                        s_out[:, : self._known_classes], t_out.detach(), tau,
+                        s_out[:, : self._known_classes].float(), t_out.detach().float(), tau,
                     )
                     s_loss_f = torch.nn.functional.mse_loss(s_f, t_f.detach())
                     loss = cur * (loss_ce_cur + self.ltc * c_loss_f) + pre * (loss_kd + s_loss_f)
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                self._optimizer_step(loss, optimizer, scaler)
                 if it == 0:
                     total_loss += loss.detach()
                     total_ce_loss += loss_ce_cur.detach()

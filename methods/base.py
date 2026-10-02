@@ -17,6 +17,19 @@ EPSILON = 1e-8
 batch_size = 64
 
 
+class _TrainingOutputs(nn.Module):
+    """Avoid gathering large feature maps from the second GPU."""
+
+    def __init__(self, model, output_keys):
+        super().__init__()
+        self.model = model
+        self.output_keys = output_keys
+
+    def forward(self, images):
+        outputs = self.model(images)
+        return {key: outputs[key] for key in self.output_keys}
+
+
 class BaseLearner(object):
     def __init__(self, args):
         self._cur_task = -1
@@ -44,22 +57,49 @@ class BaseLearner(object):
         self._fixed_memory = args.get("fixed_memory", False)
         self._device = "0"
         # self._multiple_gpus = args["device"]
+        self._t4_scaler = None
 
     def _prepare_model(self, model):
         model = model.cuda()
-        if self.args.get("fast_cuda", False):
+        if self.args.get("fast_cuda", False) or self.args.get("t4_parralel", False):
             model.to(memory_format=torch.channels_last)
         return model
 
     def _prepare_images(self, images):
-        if self.args.get("fast_cuda", False):
+        if self.args.get("fast_cuda", False) or self.args.get("t4_parralel", False):
             return images.to(device="cuda", non_blocking=True,
                              memory_format=torch.channels_last)
         return images.cuda(non_blocking=True)
 
     def _autocast(self):
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                              enabled=self.args.get("fast_cuda", False))
+        if self.args.get("fast_cuda", False):
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return torch.autocast(device_type="cuda", dtype=torch.float16,
+                              enabled=self.args.get("t4_parralel", False))
+
+    def _training_model(self, model, output_keys=("logits",)):
+        if self.args.get("t4_parralel", False):
+            forward_only = _TrainingOutputs(model, output_keys)
+            return nn.DataParallel(forward_only, device_ids=[0, 1], output_device=0)
+        return model
+
+    def _grad_scaler(self):
+        if self.args.get("t4_parralel", False):
+            if self._t4_scaler is None:
+                self._t4_scaler = torch.cuda.amp.GradScaler()
+            return self._t4_scaler
+        return None
+
+    @staticmethod
+    def _optimizer_step(loss, optimizer, scaler=None):
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is None:
+            loss.backward()
+            optimizer.step()
+        else:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
     def _should_evaluate(self, round_id):
         return ((round_id + 1) % self.args.get("eval_interval", 1) == 0 or
@@ -207,13 +247,8 @@ class BaseLearner(object):
         correct = torch.zeros((), dtype=torch.int64, device="cuda")
         total = 0
         for i, (_, inputs, targets) in enumerate(loader):
-            if self.args.get("fast_cuda", False):
-                inputs = inputs.to(device="cuda", non_blocking=True,
-                                   memory_format=torch.channels_last)
-            else:
-                inputs = inputs.cuda(non_blocking=True)
-            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                                                 enabled=self.args.get("fast_cuda", False)):
+            inputs = self._prepare_images(inputs)
+            with torch.no_grad(), self._autocast():
                 outputs = model(inputs)["logits"]
             predicts = torch.max(outputs, dim=1)[1]
             correct += (predicts == targets.cuda(non_blocking=True)).sum()
@@ -225,13 +260,8 @@ class BaseLearner(object):
         self._network.eval()
         y_pred, y_true = [], []
         for _, (_, inputs, targets) in enumerate(loader):
-            if self.args.get("fast_cuda", False):
-                inputs = inputs.to(device="cuda", non_blocking=True,
-                                   memory_format=torch.channels_last)
-            else:
-                inputs = inputs.cuda(non_blocking=True)
-            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16,
-                                                 enabled=self.args.get("fast_cuda", False)):
+            inputs = self._prepare_images(inputs)
+            with torch.no_grad(), self._autocast():
                 outputs = self._network(inputs)["logits"]
             predicts = torch.max(outputs, dim=1)[1]  # [bs] Top-1 prediction
             y_pred.append(predicts.cpu().numpy())

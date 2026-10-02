@@ -109,7 +109,8 @@ class Finetune(BaseLearner):
             np.arange(0, self._total_classes), source="test", mode="test"
         )
         self.test_loader = self._test_data_loader(test_dataset)
-        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
+        setup_seed(self.seed, fast_cuda=(self.args.get("fast_cuda", False) or
+                                        self.args.get("t4_parralel", False)))
         self._fl_train(train_dataset, self.test_loader)
         
 
@@ -155,6 +156,8 @@ class Finetune(BaseLearner):
 
     def _local_update(self, model, train_data_loader, lr=None):
         model.train()
+        forward_model = self._training_model(model)
+        scaler = self._grad_scaler()
         if lr is None:
             lr = self.args.get("local_lr", 0.01)
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
@@ -162,11 +165,9 @@ class Finetune(BaseLearner):
             for batch_idx, (_, images, labels) in enumerate(train_data_loader):
                 images, labels = self._prepare_images(images), labels.cuda(non_blocking=True)
                 with self._autocast():
-                    output = model(images)["logits"]
+                    output = forward_model(images)["logits"]
                     loss = F.cross_entropy(output, labels)
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                self._optimizer_step(loss, optimizer, scaler)
         return model.state_dict()
 
 
@@ -198,6 +199,8 @@ class Finetune(BaseLearner):
 
     def _local_finetune(self, model, train_data_loader, lr=None):
         model.train()
+        forward_model = self._training_model(model)
+        scaler = self._grad_scaler()
         if lr is None:
             lr = self.args.get("local_lr", 0.01)
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
@@ -207,11 +210,9 @@ class Finetune(BaseLearner):
                 images, labels = self._prepare_images(images), labels.cuda(non_blocking=True)
                 fake_targets = labels - self._known_classes
                 with self._autocast():
-                    output = model(images)["logits"]
+                    output = forward_model(images)["logits"]
                     loss = F.cross_entropy(output[:, self._known_classes :], fake_targets)
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                self._optimizer_step(loss, optimizer, scaler)
             # self.per_cls_acc(self.test_loader, model)
 
         return model.state_dict()

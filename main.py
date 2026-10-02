@@ -50,10 +50,17 @@ def get_learner(model_name, args):
 
 
 def train(args):
-    setup_seed(args["seed"], fast_cuda=args["fast_cuda"])
+    if args["fast_cuda"] and args["t4_parralel"]:
+        raise ValueError("--fast_cuda and --t4_parralel cannot be combined")
     if args["fast_cuda"]:
         if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
             raise RuntimeError("--fast_cuda requires a CUDA GPU with BF16 support")
+    if args["t4_parralel"]:
+        if torch.cuda.device_count() < 2:
+            raise RuntimeError("--t4_parralel requires two visible CUDA GPUs; use CUDA_VISIBLE_DEVICES=0,1")
+        torch.cuda.set_device(0)
+        print("T4 parallel mode: local batches use cuda:0 and cuda:1")
+    setup_seed(args["seed"], fast_cuda=args["fast_cuda"] or args["t4_parralel"])
     # setup the dataset and labels
     data_manager = DataManager(
         args["dataset"],
@@ -94,6 +101,8 @@ def args_parser():
     parser.add_argument('--gpu', default=0, type=int, help='GPU id to use.')
     parser.add_argument('--fast_cuda', action='store_true',
                         help='enable B200 CUDA optimizations across all learners')
+    parser.add_argument('--t4_parralel', '--t4_parallel', dest='t4_parralel', action='store_true',
+                        help='use two visible T4 GPUs for local training with FP16 where supported')
 
     # federated continual learning settings
     parser.add_argument('--dataset', type=str, default="cifar100", help='which dataset')

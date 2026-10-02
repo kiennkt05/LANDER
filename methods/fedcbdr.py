@@ -807,7 +807,8 @@ class FedCBDR(BaseLearner):
                 persistent_workers=self.args["num_worker"] > 0,
             )
 
-        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
+        setup_seed(self.seed, fast_cuda=(self.args.get("fast_cuda", False) or
+                                        self.args.get("t4_parralel", False)))
         self._fl_train(self.train_dataset, self.test_loader)
 
     def _selected_clients(self):
@@ -1085,6 +1086,8 @@ class FedCBDR(BaseLearner):
     def _local_update(self, model, train_data_loader, lr):
         print(lr)
         model.train()
+        forward_model = self._training_model(model)
+        scaler = self._grad_scaler()
         optimizer = torch.optim.SGD(
             model.parameters(),
             lr=lr,
@@ -1106,14 +1109,12 @@ class FedCBDR(BaseLearner):
                 labels = labels.cuda(non_blocking=True)
 
                 with self._autocast():
-                    output = model(images)["logits"]
+                    output = forward_model(images)["logits"]
                     sample_ce = F.cross_entropy(output, labels, reduction="none")
                     loss = sample_ce.mean()
                 self._record_mass(labels, torch.zeros_like(labels, dtype=torch.bool), sample_ce)
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                self._optimizer_step(loss, optimizer, scaler)
                 losses.append(loss.detach())
 
         loss_values = torch.stack(losses).float().cpu().numpy() if losses else np.array([])
@@ -1129,6 +1130,8 @@ class FedCBDR(BaseLearner):
 
     def _local_finetune(self, model, train_data_loader, lr):
         model.train()
+        forward_model = self._training_model(model)
+        scaler = self._grad_scaler()
         optimizer = torch.optim.SGD(
             model.parameters(),
             lr=lr,
@@ -1165,7 +1168,7 @@ class FedCBDR(BaseLearner):
                 replay_weights = replay_weights.cuda(non_blocking=True)
 
                 with self._autocast():
-                    logits = model(images)["logits"]
+                    logits = forward_model(images)["logits"]
                     loss = criterion(
                         logits,
                         labels,
@@ -1176,9 +1179,7 @@ class FedCBDR(BaseLearner):
                 if self._active_tracker is not None:
                     self._active_tracker.record(labels, is_replay, criterion.last_sample_ce)
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                self._optimizer_step(loss, optimizer, scaler)
                 losses.append(loss.detach())
 
             loss_values = torch.stack(losses).float().cpu().numpy() if losses else np.array([])

@@ -62,6 +62,33 @@ its best-per-class summary. Most learners reuse data-loader workers across commu
 For a fair speed comparison, use the same dataset, batch size, and task settings
 with and without `--fast_cuda`, and synchronize CUDA before measuring elapsed time.
 
+### Kaggle Tesla T4 x2
+
+The previously working PyTorch 2.2 CUDA 11.8 environment can be used on T4;
+the CUDA 12.8 install above is intended for Blackwell.
+Expose both GPUs and use `--t4_parralel` (the spelling `--t4_parallel` is also accepted):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python main.py --group=c100t5 --exp_name=fedcbdr \
+  --dataset=cifar100 --method=fedcbdr --fedcbdr_lr_schedule=cosine \
+  --tasks=5 --num_users=5 --beta=0.1 --seed=2023 \
+  --gdr_protocol=repo_local --tts_mode=repo_dual \
+  --num_worker=2 --t4_parralel
+```
+
+This mode splits each local client training batch across the two GPUs with
+`DataParallel`, uses FP16 autocast with gradient scaling for Finetune, LANDER,
+and FedCBDR, and enables channels-last convolutions. Exp5 and Exp6 also split
+local model forwards but keep trajectory gradients in FP32. Global aggregation,
+evaluation, replay selection, and synthetic-data generation still use GPU 0.
+`--fast_cuda` and `--t4_parralel` cannot be combined. The flag requires two
+visible CUDA GPUs and does not change the local batch size or client sampling.
+Benchmark full communication rounds against the single-T4 run: `DataParallel`
+can be slower for small batches because it copies model replicas each forward.
+Keep `--local_bs=128` for a like-for-like comparison; increasing it changes the
+number of optimizer steps per local epoch. With five persistent client loaders,
+`--num_worker=2` starts ten client workers, so tune it for Kaggle's CPU allocation.
+
 ## Baseline
 Here, we provide a simple example for different methods. 
 For example, for `cifar100-5tasks`, please run the following commands to test the model performance with non-IID (`$\beta=0.5$`) data.

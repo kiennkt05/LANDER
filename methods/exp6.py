@@ -730,7 +730,8 @@ class Exp6Global(Exp5aGlobal):
             seed=self.seed,
             cur_task=self._cur_task,
             mask_seed_offset=self.exp5a_mask_seed_offset,
-            fast_cuda=self.args.get("fast_cuda", False),
+            fast_cuda=(self.args.get("fast_cuda", False) or
+                       self.args.get("t4_parralel", False)),
         )
         rho_global = diagnostics["rho_global"]
         print(f"[{self.exp6_variant_name}-Global] Global retained trajectory energy rho_global: {rho_global:.4f}")
@@ -848,7 +849,8 @@ unique={metrics['unique']}
         )
         self.test_loader = self._test_data_loader(test_dataset)
 
-        setup_seed(self.seed, fast_cuda=self.args.get("fast_cuda", False))
+        setup_seed(self.seed, fast_cuda=(self.args.get("fast_cuda", False) or
+                                        self.args.get("t4_parralel", False)))
         partition_res = partition_data(
             train_dataset.labels, beta=self.args["beta"], n_parties=self.num_users
         )
