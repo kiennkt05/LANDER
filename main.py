@@ -222,7 +222,7 @@ if __name__ == '__main__':
     budget = {
         "cifar10": {3: 450, 5: 300},
         "cifar100": {5: 1000, 10: 500},
-        "tiny_imagenet": {5: 500, 10: 250},
+        "tiny_imagenet": {10: 2000, 20: 1000},
     }
     
     args.gdr_task_budget = budget[args.dataset][args.tasks]
