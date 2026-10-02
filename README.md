@@ -48,10 +48,11 @@ CUDA_VISIBLE_DEVICES=0 python main.py --group=c100t5 --exp_name=fedcbdr \
 The FedCBDR T2/T4 historical-class monitoring and paired A-to-C intervention
 workflow is documented in [docs/fedcbdr_monitoring.md](docs/fedcbdr_monitoring.md).
 
-This mode uses BF16 autocast, channels-last convolutions, pinned transfers, and
-cuDNN benchmarking. It changes floating-point rounding and disables deterministic
-cuDNN selection, so compare accuracy with a standard run before relying on its
-results. BF16 covers neural-network training in LANDER, TARGET, FedCBDR, and the
+This mode uses BF16 autocast, channels-last convolutions, and pinned transfers.
+It changes floating-point rounding, so compare accuracy with a standard run
+before relying on its results. All runs use deterministic PyTorch algorithms and
+disable cuDNN benchmarking so full and resumed task sequences use the same kernels.
+BF16 covers neural-network training in LANDER, TARGET, FedCBDR, and the
 Finetune, LwF, iCaRL, and EWC baselines. Exp5 and Exp6 keep their exact
 trajectory training in FP32, while using channels-last layout and pinned input
 transfers. FedCBDR replay feature extraction and QR/SVD also stay in FP32.
@@ -70,7 +71,7 @@ Expose both GPUs and use `--t4_parralel` (the spelling `--t4_parallel` is also a
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python main.py --group=c100t5 --exp_name=fedcbdr \
-  --dataset=cifar100 --method=fedcbdr --fedcbdr_lr_schedule=cosine \
+  --dataset=cifar100 --method=fedcbdr --fedcbdr_lr_scheduler=cosine \
   --tasks=5 --num_users=5 --beta=0.1 --seed=2023 \
   --gdr_protocol=repo_local --tts_mode=repo_dual \
   --num_worker=2 --t4_parralel
@@ -88,6 +89,38 @@ can be slower for small batches because it copies model replicas each forward.
 Keep `--local_bs=128` for a like-for-like comparison; increasing it changes the
 number of optimizer steps per local epoch. With five persistent client loaders,
 `--num_worker=2` starts ten client workers, so tune it for Kaggle's CPU allocation.
+
+### Stop and resume at a task boundary
+
+`--num_tasks_to_run` counts tasks in this invocation. To train the first 10 of 20
+CIFAR-100 tasks and then the remaining 10, run the same training options both
+times (including the GPU flags, if used):
+
+```bash
+python main.py --dataset=cifar100 --method=fedcbdr --tasks=20 \
+  --group=c100t20 --exp_name=split --num_users=5 --beta=0.1 --seed=2023 \
+  --num_tasks_to_run=10
+
+python main.py --dataset=cifar100 --method=fedcbdr --tasks=20 \
+  --group=c100t20 --exp_name=split --num_users=5 --beta=0.1 --seed=2023 \
+  --resume --num_tasks_to_run=10
+```
+
+The default checkpoint is `run/<group>_<beta>_<method>_<exp_name><spec>/task_resume.pt`.
+Use `--checkpoint_path=PATH` to choose another output file; `--resume=PATH` loads
+a specific file. A run with `--resume` and no `--num_tasks_to_run` finishes all
+remaining tasks. The checkpoint contains the learner, replay state, random-number
+generator states, accuracy curve, and the LANDER images needed for the next task.
+Copy the checkpoint to a new session if needed; LANDER replay images are restored
+from it. FedCBDR's `metrics.jsonl` and Exp5's diagnostics log are restored too.
+Retain other monitoring artifacts separately if you use them for analysis.
+
+Without `--num_tasks_to_run`, a fresh run completes all tasks in one invocation.
+Full and split runs use the same deterministic PyTorch settings automatically.
+Use the same dataset files, Python and library versions, GPU model/count, and code
+for both segments. Resume checks the code, environment, task count, class order,
+and training arguments before loading. Deterministic kernels may run more slowly;
+PyTorch can raise an error if an operation has no deterministic implementation.
 
 ## Baseline
 Here, we provide a simple example for different methods. 

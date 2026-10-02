@@ -12,44 +12,39 @@ from methods.lander import LANDER
 from methods.exp5 import Exp5aLocal, Exp5aGlobal, Exp5bTopK, Exp5bFedCBDR
 from methods.exp6 import Exp6Global, Exp6bGlobal
 from methods.fedcbdr import FedCBDR
+from utils.task_resume import load_task_checkpoint, save_task_checkpoint
 import warnings
 
 warnings.filterwarnings('ignore')
 
 
+LEARNERS = {
+    "exp5a_local": Exp5aLocal, "exp5a_global": Exp5aGlobal,
+    "exp5b_topk": Exp5bTopK, "exp5b_fedcbdr": Exp5bFedCBDR,
+    "exp6_global": Exp6Global, "exp6b_global": Exp6bGlobal,
+    "finetune": Finetune, "lander": LANDER, "fedcbdr": FedCBDR,
+}
+
+
+def get_learner_type(model_name):
+    try:
+        return LEARNERS[model_name.lower()]
+    except KeyError as exc:
+        raise ValueError("Unknown learner: {}".format(model_name)) from exc
+
+
 def get_learner(model_name, args):
-    name = model_name.lower()
-    if name == "exp5a_local":
-        return Exp5aLocal(args)
-    elif name == "exp5a_global":
-        return Exp5aGlobal(args)
-    elif name == "exp5b_topk":
-        return Exp5bTopK(args)
-    elif name == "exp5b_fedcbdr":
-        return Exp5bFedCBDR(args)
-    elif name == "exp6_global":
-        return Exp6Global(args)
-    elif name == "exp6b_global":
-        return Exp6bGlobal(args)
-    elif name == "icarl":
-        return iCaRL(args)
-    elif name == "ewc":
-        return EWC(args)
-    elif name == "lwf":
-        return LwF(args)
-    elif name == "finetune":
-        return Finetune(args)
-    elif name == "target":
-        return TARGET(args)
-    elif name == "lander":
-        return LANDER(args)
-    elif name == "fedcbdr":
-        return FedCBDR(args)
-    else:
-        assert 0
+    return get_learner_type(model_name)(args)
 
 
 def train(args):
+    checkpointing = args.get("num_tasks_to_run") is not None or args.get("resume") is not None
+    if checkpointing and args["method"].lower() == "lander" and args.get("type", -1) != -1:
+        raise ValueError("LANDER task resume requires --type=-1")
+    # Full and resumed runs must use the same kernels for task-boundary parity.
+    # Set this before CUDA initializes a cuBLAS handle.
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True)
     if args["fast_cuda"] and args["t4_parralel"]:
         raise ValueError("--fast_cuda and --t4_parralel cannot be combined")
     if args["fast_cuda"]:
@@ -71,12 +66,26 @@ def train(args):
         args
     )
     args["class_order"] = data_manager.get_class_order()
-    learner = get_learner(args["method"], args)
-    cnn_curve, nme_curve = {"top1": []}, {"top1": []}
+    run_config = dict(args)
+    total_tasks = data_manager.nb_tasks
+    checkpoint_path = args.get("checkpoint_path") or os.path.join(args["save_dir"], "task_resume.pt")
+    resume = args.get("resume")
+    if resume is not None:
+        resume_path = checkpoint_path if resume == "auto" else resume
+        learner, start_task, cnn_curve = load_task_checkpoint(
+            resume_path, run_config, data_manager, get_learner_type(args["method"]))
+        print("Resumed after task {} of {} from {}".format(start_task, total_tasks, resume_path))
+    else:
+        learner = get_learner(args["method"], args)
+        start_task, cnn_curve = 0, {"top1": []}
+    num_to_run = args.get("num_tasks_to_run")
+    stop_task = total_tasks if num_to_run is None else min(total_tasks, start_task + num_to_run)
+    if start_task >= total_tasks:
+        print("All {} tasks are already complete".format(total_tasks))
+        return cnn_curve
 
     # train for each task
-    for task in range(data_manager.nb_tasks):
-    # for task in range(2):
+    for task in range(start_task, stop_task):
         print("All params: {}, Trainable params: {}".format(count_parameters(learner._network),
                                                             count_parameters(learner._network, True)))
         learner.incremental_train(data_manager)  # train for one task
@@ -86,6 +95,13 @@ def train(args):
         print("CNN: {}".format(cnn_accy["grouped"]))
         cnn_curve["top1"].append(cnn_accy["top1"])
         print("CNN top1 curve: {}".format(cnn_curve["top1"]))
+
+    if checkpointing:
+        saved = save_task_checkpoint(checkpoint_path, learner, run_config,
+                                     stop_task, total_tasks, cnn_curve)
+        print("Saved task checkpoint: {} ({} of {} tasks complete)".format(
+            saved, stop_task, total_tasks))
+    return cnn_curve
 
 
 def args_parser():
@@ -103,6 +119,12 @@ def args_parser():
                         help='enable B200 CUDA optimizations across all learners')
     parser.add_argument('--t4_parralel', '--t4_parallel', dest='t4_parralel', action='store_true',
                         help='use two visible T4 GPUs for local training with FP16 where supported')
+    parser.add_argument('--num_tasks_to_run', type=int, default=None,
+                        help='run this many tasks now, then save a task-boundary checkpoint')
+    parser.add_argument('--resume', nargs='?', const='auto', default=None, metavar='CHECKPOINT',
+                        help='continue from a task checkpoint (default: save_dir/task_resume.pt)')
+    parser.add_argument('--checkpoint_path', type=str, default=None,
+                        help='task-boundary checkpoint output path')
 
     # federated continual learning settings
     parser.add_argument('--dataset', type=str, default="cifar100", help='which dataset')
@@ -209,6 +231,8 @@ def args_parser():
         parser.error('--eval_interval must be a positive integer')
     if args.synthesis_eval_interval < 1:
         parser.error('--synthesis_eval_interval must be a positive integer')
+    if args.num_tasks_to_run is not None and args.num_tasks_to_run < 1:
+        parser.error('--num_tasks_to_run must be a positive integer')
 
     return args
 
@@ -230,11 +254,15 @@ if __name__ == '__main__':
     # Match and validate gdr_task_budget based on dataset name and number of tasks
     budget = {
         "cifar10": {3: 450, 5: 300},
-        "cifar100": {5: 1000, 10: 500},
+        "cifar100": {5: 1000, 10: 500, 20: 250},
         "tiny_imagenet": {10: 2000, 20: 1000},
     }
     
-    args.gdr_task_budget = budget[args.dataset][args.tasks]
+    if args.gdr_task_budget is None:
+        try:
+            args.gdr_task_budget = budget[args.dataset][args.tasks]
+        except KeyError as exc:
+            raise ValueError("Specify --gdr_task_budget for this dataset/task count") from exc
 
     args.init_cls = int(args.num_class / args.tasks)
     args.increment = args.init_cls
@@ -248,7 +276,8 @@ if __name__ == '__main__':
         os.makedirs(dir)
     if not os.path.exists("store"):
         os.makedirs("store")
-    args.save_dir = os.path.join(dir, args.group + "_" + args.exp_name + "" + args.spec)
+    if not args.save_dir:
+        args.save_dir = os.path.join(dir, args.group + "_" + args.exp_name + "" + args.spec)
 
     if args.wandb == 1:
         wandb.init(config=args, project=args.project, group=args.group, name=args.exp_name)

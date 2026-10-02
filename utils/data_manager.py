@@ -11,6 +11,8 @@ import torch.backends.cudnn as cudnn
 
 
 def setup_seed(seed, fast_cuda=False):
+    if torch.are_deterministic_algorithms_enabled():
+        fast_cuda = False
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.cuda.manual_seed(seed)
