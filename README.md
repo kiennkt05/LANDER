@@ -63,6 +63,12 @@ its best-per-class summary. Most learners reuse data-loader workers across commu
 For a fair speed comparison, use the same dataset, batch size, and task settings
 with and without `--fast_cuda`, and synchronize CUDA before measuring elapsed time.
 
+`--fedcbdr_lr_scheduler` applies to every method despite its historical name.
+`constant` (the default) keeps `--local_lr` unchanged across communication rounds;
+`cosine` anneals it toward `min(0.001, local_lr)` over `--com_round` rounds. This
+also replaces the previous implicit 50/75-round step schedule on Tiny ImageNet,
+so older runs made with either flag are not directly comparable to new runs.
+
 ### Kaggle Tesla T4 x2
 
 The previously working PyTorch 2.2 CUDA 11.8 environment can be used on T4;
