@@ -111,15 +111,12 @@ class BaseLearner(object):
             self.args.get("fedcbdr_lr_schedule", "constant"),
         )
         if schedule == "constant":
-            return torch.optim.lr_scheduler.ConstantLR(
-                optimizer, factor=1.0, total_iters=self.args["com_round"]
-            )
-        if schedule == "cosine":
-            base_lr = min(group["lr"] for group in optimizer.param_groups)
-            return torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=self.args["com_round"], eta_min=min(1e-3, base_lr)
-            )
-        raise ValueError("Unknown learning-rate scheduler: {}".format(schedule))
+            scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=self.args["com_round"])
+        elif self.args["dataset"] == "tiny_imagenet":
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 75], gamma=0.1)
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.args["com_round"], eta_min=1e-3)
+        return scheduler
 
     def _get_scheduler(self, optimizer):
         return self._init_scheduler(optimizer)
