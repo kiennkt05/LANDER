@@ -112,9 +112,9 @@ class BaseLearner(object):
         )
         if schedule == "constant":
             scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=self.args["com_round"])
-        elif self.args["dataset"] == "tiny_imagenet":
+        elif self.args["dataset"] == "tiny_imagenet" or schedule == "multi_step":
             scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[50, 75], gamma=0.1)
-        else:
+        elif schedule == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.args["com_round"], eta_min=1e-3)
         return scheduler
 
