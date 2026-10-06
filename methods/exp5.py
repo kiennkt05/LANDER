@@ -1142,75 +1142,50 @@ class Exp5aGlobal(Exp5Base):
     """Exp5a-Global: All clients share one globally coordinated rank-r basis."""
     def __init__(self, args):
         super().__init__(args)
+        # Exp6 inherits this setting for its separate masked projection path.
         self.exp5a_mask_layers = args.get("exp5a_mask_layers", 12)
 
     def _compute_projected_trajectories(self, user_groups, offsets, cand_rows):
         K = self.num_users
         r_target = self.exp5a_rank
         p = self.exp5a_svd_oversampling
-        layers = self.exp5a_mask_layers
+        # Client trajectory blocks already occupy consecutive rows of this matrix.
+        X = self.trajectory_matrix
+        N, D = X.shape
 
-        N = self.trajectory_matrix.shape[0]
-        D = self.trajectory_matrix.shape[1]
-
-        # 1. Common D-dimensional feature-space orthogonal mask Q
-        mask_seed = self.seed + self._cur_task * 5000
-        Q = _ImplicitOrthogonalMask(D, num_layers=layers, seed=mask_seed)
-
-        # 2. Pool masked blocks X'_k = P_k X_k Q vertically into X' in R^(N x D)
-        X_prime = torch.zeros((N, D), dtype=torch.float32)
-
-        for k in range(K):
-            Nk = len(user_groups[k])
-            start_idx = offsets[k]
-            end_idx = start_idx + Nk
-            X_k = self.trajectory_matrix[start_idx:end_idx].clone()
-
-            # Client sample-space orthogonal row mask P_k
-            row_seed = mask_seed + 100 + k
-            P_k = _ImplicitOrthogonalMask(Nk, num_layers=layers, seed=row_seed)
-
-            X_k_masked_rows = P_k.apply_left(X_k)
-            X_k_prime = Q.apply_right(X_k_masked_rows)
-            X_prime[start_idx:end_idx] = X_k_prime
-
-        # 3. Learn global trajectory subspace on pooled X'
+        # Learn one shared subspace from the unmasked pooled trajectories.
         r_glob = min(r_target, N, D)
         q = min(r_glob + p, N, D)
 
         setup_seed(self.seed + self._cur_task * 1000,
                    fast_cuda=(self.args.get("fast_cuda", False) or
                               self.args.get("t4_parralel", False)))
-        U_prime, S_prime, V_prime = torch.pca_lowrank(X_prime, q=q, center=False)
-        R_prime_r = V_prime[:, :r_glob]
+        _, S, V = torch.pca_lowrank(X, q=q, center=False)
+        R_r = V[:, :r_glob]
 
-        fro_sq = torch.sum(X_prime ** 2) + 1e-8
-        rho_global = (torch.sum(S_prime[:r_glob] ** 2) / fro_sq).item()
+        fro_sq = torch.sum(X ** 2) + 1e-8
+        rho_global = (torch.sum(S[:r_glob] ** 2) / fro_sq).item()
         print(f"[Exp5a-Global] Global retained trajectory energy rho_global: {rho_global:.4f}")
 
         if self.wandb == 1 and wandb is not None:
             wandb.log({f"Task_{self._cur_task}/global_retained_energy": rho_global})
 
-        del X_prime
-
-        # 4. Project un-row-mixed client vectors: Z_k = (X_k Q) R'_r
+        # Project each client's original trajectories into the shared basis.
         Z_dict = {}
         R_dict = {}
         for k in range(K):
             Nk = len(user_groups[k])
             start_idx = offsets[k]
             end_idx = start_idx + Nk
-            X_k = self.trajectory_matrix[start_idx:end_idx]
-
-            X_k_Q = Q.apply_right(X_k)
-            Z_k = X_k_Q @ R_prime_r
+            X_k = X[start_idx:end_idx]
+            Z_k = X_k @ R_r
             Z_dict[k] = Z_k
-            R_dict[k] = R_prime_r
+            R_dict[k] = R_r
 
         return Z_dict, R_dict, [rho_global]
 
     def _log_global_z_error(self, selected_by_client, Z_dict, user_groups):
-        """Global z-space error is geometrically meaningful because all clients share R'_r."""
+        """Global z-space error is geometrically meaningful because all clients share R_r."""
         K = self.num_users
         r_dim = Z_dict[0].shape[1]
         sum_hat_z = torch.zeros(r_dim, dtype=torch.float32)
