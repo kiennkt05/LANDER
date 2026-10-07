@@ -208,8 +208,8 @@ def args_parser():
     parser.add_argument('--gdr_task_budget', default=None, type=int, help='replay budget M per task')
     parser.add_argument('--exp5a_rank', default=128, type=int, help='projection rank r')
     parser.add_argument('--exp5a_svd_oversampling', default=16, type=int, help='randomized-PCA oversampling p')
-    parser.add_argument('--exp5a_mask_layers', default=12, type=int, help='number of orthogonal mask layers')
-    parser.add_argument('--exp5a_mask_seed_offset', default=5000, type=int, help='mask seed stride offset across tasks')
+    parser.add_argument('--exp5a_mask_layers', default=12, type=int, help='number of orthogonal mask layers for Exp6 (unused by Exp5)')
+    parser.add_argument('--exp5a_mask_seed_offset', default=5000, type=int, help='mask seed stride across tasks for Exp6 (unused by Exp5)')
     parser.add_argument('--exp5a_target_mode', default='budget_scaled_sum', type=str, choices=['budget_scaled_sum', 'full_sum'], help='reconstruction target mode')
     parser.add_argument('--exp5a_tau', default=0.05, type=float, help='attribution invariant tolerance tau')
 
