@@ -773,8 +773,6 @@ class LANDER(BaseLearner):
 
     def _fl_train(self, train_dataset, test_loader):
         self._network.cuda()
-        self.best_model = None  # Best model using the lowest training loss
-        self.lowest_loss = np.inf
         user_groups, _ = partition_data(train_dataset.labels, beta=self.args["beta"], n_parties=self.args["num_users"])
         prog_bar = tqdm(range(self.args["com_round"]))
         optimizer = torch.optim.SGD(self._network.parameters(), lr=self.args['local_lr'], momentum=0.9, weight_decay=self.args['weight_decay'])
@@ -814,11 +812,6 @@ class LANDER(BaseLearner):
             self._network.load_state_dict(global_weights)
             del local_weights, global_weights
 
-            sum_loss = sum(loss_weight)
-            if sum_loss < self.lowest_loss:
-                self.lowest_loss = sum_loss
-                self.best_model = copy.deepcopy(self._network.state_dict())
-
             if ((com + 1) % self.args.get("eval_interval", 1) == 0 or
                     com + 1 == self.args["com_round"]):
                 test_acc = self._compute_accuracy(self._network, test_loader)
@@ -832,8 +825,6 @@ class LANDER(BaseLearner):
                 prog_bar.set_description(info)
                 if self.wandb == 1:
                     wandb.log({'Task_{}, accuracy'.format(self._cur_task): test_acc})
-        self._network.load_state_dict(self.best_model)  # Best model using the lowest training loss
-        del self.best_model
         del client_model, local_train_loaders
 
     def _local_update(self, model, train_data_loader, lr):

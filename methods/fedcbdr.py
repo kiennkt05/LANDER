@@ -872,9 +872,6 @@ class FedCBDR(BaseLearner):
 
     def _fl_train(self, train_dataset, test_loader, frozen_partition=False):
         self._prepare_model(self._network)
-        self.best_model = None  # Best model using the lowest training loss
-        self.lowest_loss = np.inf
-        self.best_round = None
 
         if not frozen_partition:
             user_groups, _ = partition_data(
@@ -998,11 +995,6 @@ class FedCBDR(BaseLearner):
                                        class_task_id=self.task_registry.task_for(c), is_replay=replay,
                                        draws=count, mean_ce=mass/count, ce_mass_proxy=mass)
 
-            sum_loss = sum(loss_weight)
-            if sum_loss < self.lowest_loss:
-                self.lowest_loss = sum_loss
-                self.best_model = copy.deepcopy(self._network.state_dict())
-                self.best_round = com
 
             if self._should_evaluate(com):
                 test_acc = self._compute_fedcbdr_accuracy(
@@ -1063,15 +1055,13 @@ class FedCBDR(BaseLearner):
                     except ImportError:
                         pass
 
-        self._network.load_state_dict(self.best_model)  # Best model using the lowest training loss
-        del self.best_model
         del client_model, client_loaders
 
         if self.metrics:
             self._log_probe("selected")
             self.metrics.write("selected_model", self._cur_task, "selected",
-                               source_round=self.best_round,
-                               selection_loss=float(self.lowest_loss))
+                               source_round=self.args["com_round"] - 1,
+                               selection_loss=mean_local_loss)
             boundary_logits, boundary_labels, _ = extract_probe_outputs(
                 self._network, self.probes.loader())
             self.metrics.set_boundary(boundary_logits, boundary_labels)

@@ -201,6 +201,7 @@ class Exp5Base(BaseLearner):
         self.repo_dual = args.get("repo_dual", False)
         if sum(bool(mode) for mode in (self.exp5_distill_loss, self.exp5_single_distill_loss, self.repo_dual)) > 1:
             raise ValueError("Choose only one Exp5 loss variant.")
+        self.sample_weighted_fedavg = args.get("sample_weighted_fedavg", False)
         self._repo_dual_loss = None
         if self.repo_dual:
             self._repo_dual_loss = TaskAwareTemperatureScalingLoss(
@@ -320,10 +321,6 @@ class Exp5Base(BaseLearner):
         com_round = self.args["com_round"]
         prog_bar = tqdm(range(com_round), desc=f"Task {self._cur_task} FL Training")
 
-        self.best_model = None  # Best model using the lowest training loss
-        self.lowest_loss = np.inf
-        best_round = None  # diagnostic only: trajectory still accumulates through all rounds
-
         local_lr = self.args.get("local_lr", 0.01)
         momentum = 0.9
         weight_decay = self.args.get("weight_decay", 5e-4)
@@ -348,16 +345,21 @@ class Exp5Base(BaseLearner):
 
             # Client selection
             idxs_users = range(self.args["num_users"])
-            p_k = 1.0 / self.args["num_users"]
+            if self.sample_weighted_fedavg:
+                sample_counts = [len(user_groups[k]) + self.repeat_rate * sum(map(len, self.retained_ds_all[k])) for k in idxs_users]
+                client_weights = [n / sum(sample_counts) for n in sample_counts]
+            else:
+                p_k = 1.0 / self.args["num_users"]
 
             round_delta_cur = torch.zeros(D, dtype=torch.float32)
             round_delta_rep = torch.zeros(D, dtype=torch.float32)
             round_delta_wd = torch.zeros(D, dtype=torch.float32)
 
             local_weights = []
-            loss_weight = []
 
             for k in idxs_users:
+                if self.sample_weighted_fedavg:
+                    p_k = client_weights[k]
                 local_model = copy.deepcopy(self._network)
                 local_model.train()
                 self._prepare_model(local_model)
@@ -388,7 +390,6 @@ class Exp5Base(BaseLearner):
                 S = local_ep * num_steps_per_epoch
                 step = 0
 
-                client_loss = 0.0
                 for ep in range(local_ep):
                     for batch_idx, (b_idxs, images, labels, is_cur, cands) in enumerate(local_loader):
                         step += 1
@@ -410,8 +411,6 @@ class Exp5Base(BaseLearner):
                         logits = outputs["logits"]
 
                         loss = self._training_loss(logits, labels, is_cur, b_idxs, client_ds)
-                        if ep == 0:
-                            client_loss += loss.detach()
 
                         # Exact derivative of optimized scalar loss with respect to logits
                         q = torch.autograd.grad(loss, logits, retain_graph=True)[0]
@@ -457,19 +456,20 @@ class Exp5Base(BaseLearner):
                         optimizer.step()
 
                 local_weights.append(copy.deepcopy(local_model.state_dict()))
-                loss_weight.append(client_loss)
                 del local_loader, forward_model, local_model
 
             # FedAvg aggregation
-            global_weights = average_weights(local_weights)
+            if self.sample_weighted_fedavg:
+                global_weights = copy.deepcopy(local_weights[0])
+                for key in global_weights:
+                    if global_weights[key].is_floating_point():
+                        global_weights[key] = sum((local_weights[i][key] * client_weights[i] for i in range(len(local_weights))), torch.zeros_like(global_weights[key]))
+                    else:
+                        global_weights[key] = sum((local_weights[i][key].float() * client_weights[i] for i in range(len(local_weights))), torch.zeros_like(global_weights[key], dtype=torch.float32)).round().to(global_weights[key].dtype)
+            else:
+                global_weights = average_weights(local_weights)
             self._network.load_state_dict(global_weights)
             scheduler.step()
-
-            sum_loss = sum(loss_weight)
-            if sum_loss < self.lowest_loss:
-                self.lowest_loss = sum_loss
-                best_round = com + 1
-                self.best_model = copy.deepcopy(self._network.state_dict())
 
             # Measure actual FedAvg classifier head delta
             head_after = torch.cat([
@@ -510,15 +510,6 @@ class Exp5Base(BaseLearner):
                 "Coreset selection is aborted as mandated by Exp5 specification."
             )
         print("[Attribution Invariant Gate] PASSED successfully.")
-        loss_value = float(self.lowest_loss.detach().cpu().item()) if torch.is_tensor(self.lowest_loss) else float(self.lowest_loss)
-        print(
-            f"[EXP5_BEST_MODEL_DIAG] task={self._cur_task} best_round={best_round}/{com_round} "
-            f"lowest_loss={loss_value:.8e} trajectory_accumulated_rounds={com_round} "
-            f"rollback={int(best_round is not None and best_round != com_round)}"
-        )
-
-        self._network.load_state_dict(self.best_model)  # Best model using the lowest training loss
-        del self.best_model
 
     def _training_loss(self, logits, labels, is_cur, batch_indices, client_ds):
         """Select CE, FedCBDR repo_dual TTS, or all-sample CE plus replay logit MSE."""
@@ -543,7 +534,7 @@ class Exp5Base(BaseLearner):
 
     @torch.no_grad()
     def _refresh_replay_logits(self, datasets=None):
-        """Capture supplied datasets (or all replay) using the restored best model."""
+        """Capture supplied datasets (or all replay) using the trained model."""
         if datasets is None:
             datasets = [ds for client_datasets in self.retained_ds_all.values() for ds in client_datasets]
         model = self._network

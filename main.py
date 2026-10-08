@@ -201,6 +201,7 @@ def args_parser():
 
     # Exp5 Trajectory Subspace Replay
     parser.add_argument('--repeat_rate', default=1, type=int, help='number of appearances per retained replay item in each Exp5 local epoch (positive integer; current items appear once)')
+    parser.add_argument('--sample_weighted_fedavg', action='store_true', help='enable sample-weighted FedAvg and client attribution in Exp5')
     exp5_loss = parser.add_mutually_exclusive_group()
     exp5_loss.add_argument('--repo_dual', action='store_true', help='use FedCBDR repo_dual TTS loss in Exp5 with tau_old/tau_new and w_old/w_new')
     exp5_loss.add_argument('--exp5_distill_loss', action='store_true', help='use current-sample CE and replay MSE, refreshing all replay logits after each task')
