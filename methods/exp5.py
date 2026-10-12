@@ -335,167 +335,190 @@ class Exp5Base(BaseLearner):
         optimizer_head = torch.optim.SGD(self._network.parameters(), lr=local_lr, momentum=momentum, weight_decay=weight_decay)
         scheduler = self._init_scheduler(optimizer_head)
 
-        for com in prog_bar:
-            current_lr = scheduler.get_last_lr()[0]
-            # Snapshot head parameters before local training
-            head_before = torch.cat([
-                self._network.fc.weight.data.flatten(),
-                self._network.fc.bias.data.flatten()
-            ]).detach().cpu()
+        # LANDER_PERSISTENT_CLIENT_LOADERS_V1: one persistent loader per client, per task
+        _client_loader_cache = {}
+        try:
+            for com in prog_bar:
+                current_lr = scheduler.get_last_lr()[0]
+                # Snapshot head parameters before local training
+                head_before = torch.cat([
+                    self._network.fc.weight.data.flatten(),
+                    self._network.fc.bias.data.flatten()
+                ]).detach().cpu()
 
-            # Client selection
-            idxs_users = range(self.args["num_users"])
-            if self.sample_weighted_fedavg:
-                sample_counts = [len(user_groups[k]) + self.repeat_rate * sum(map(len, self.retained_ds_all[k])) for k in idxs_users]
-                client_weights = [n / sum(sample_counts) for n in sample_counts]
-            else:
-                p_k = 1.0 / self.args["num_users"]
-
-            round_delta_cur = torch.zeros(D, dtype=torch.float32)
-            round_delta_rep = torch.zeros(D, dtype=torch.float32)
-            round_delta_wd = torch.zeros(D, dtype=torch.float32)
-
-            local_weights = []
-
-            for k in idxs_users:
+                # Client selection
+                idxs_users = range(self.args["num_users"])
                 if self.sample_weighted_fedavg:
-                    p_k = client_weights[k]
-                local_model = copy.deepcopy(self._network)
-                local_model.train()
-                self._prepare_model(local_model)
-                forward_model = self._training_model(local_model, ("logits", "features"))
+                    sample_counts = [len(user_groups[k]) + self.repeat_rate * sum(map(len, self.retained_ds_all[k])) for k in idxs_users]
+                    client_weights = [n / sum(sample_counts) for n in sample_counts]
+                else:
+                    p_k = 1.0 / self.args["num_users"]
 
-                Nk = len(user_groups[k])
-                cand_ids = np.arange(offsets[k], offsets[k] + Nk)
-                cur_ds = DatasetSplit(train_dataset, user_groups[k])
-                client_ds = ClientTaskDataset(
-                    cur_ds, cand_ids, self.retained_ds_all[k], repeat_rate=self.repeat_rate
-                )
+                round_delta_cur = torch.zeros(D, dtype=torch.float32)
+                round_delta_rep = torch.zeros(D, dtype=torch.float32)
+                round_delta_wd = torch.zeros(D, dtype=torch.float32)
 
-                local_loader = DataLoader(
-                    client_ds, batch_size=local_bs, shuffle=True,
-                    num_workers=self.args["num_worker"], pin_memory=True
-                )
+                local_weights = []
 
-                optimizer = torch.optim.SGD(
-                    local_model.parameters(),
-                    lr=current_lr,
-                    momentum=momentum,
-                    weight_decay=weight_decay,
-                    dampening=0.0,
-                    nesterov=False,
-                )
+                for k in idxs_users:
+                    if self.sample_weighted_fedavg:
+                        p_k = client_weights[k]
+                    local_model = copy.deepcopy(self._network)
+                    local_model.train()
+                    self._prepare_model(local_model)
+                    forward_model = self._training_model(local_model, ("logits", "features"))
 
-                num_steps_per_epoch = len(local_loader)
-                S = local_ep * num_steps_per_epoch
-                step = 0
+                    Nk = len(user_groups[k])
+                    cand_ids = np.arange(offsets[k], offsets[k] + Nk)
+                    cur_ds = DatasetSplit(train_dataset, user_groups[k])
+                    client_ds = ClientTaskDataset(
+                        cur_ds, cand_ids, self.retained_ds_all[k], repeat_rate=self.repeat_rate
+                    )
 
-                for ep in range(local_ep):
-                    for batch_idx, (b_idxs, images, labels, is_cur, cands) in enumerate(local_loader):
-                        step += 1
-                        # Exact momentum multiplier: W_s = (1 - mu^(S - s + 1)) / (1 - mu)
-                        W_s = (1.0 - (momentum ** (S - step + 1))) / (1.0 - momentum)
+                    local_loader = _client_loader_cache.get(k)
+                    if local_loader is None:
+                        local_loader = DataLoader(
+                            client_ds,
+                            batch_size=local_bs,
+                            shuffle=True,
+                            num_workers=self.args['num_worker'],
+                            pin_memory=True,
+                            persistent_workers=(self.args['num_worker'] > 0),
+                        )
+                        _client_loader_cache[k] = local_loader
 
-                        # Keep exact trajectory derivatives in FP32 for the invariant gate.
-                        images = self._prepare_images(images)
-                        labels = labels.cuda(non_blocking=True)
+                    optimizer = torch.optim.SGD(
+                        local_model.parameters(),
+                        lr=current_lr,
+                        momentum=momentum,
+                        weight_decay=weight_decay,
+                        dampening=0.0,
+                        nesterov=False,
+                    )
 
-                        # Capture head parameters before update step for weight decay attribution
-                        theta_head = torch.cat([
-                            local_model.fc.weight.data.flatten(),
-                            local_model.fc.bias.data.flatten()
-                        ]).detach().cpu()
+                    num_steps_per_epoch = len(local_loader)
+                    S = local_ep * num_steps_per_epoch
+                    step = 0
 
-                        outputs = forward_model(images)
-                        features = outputs["features"]
-                        logits = outputs["logits"]
+                    for ep in range(local_ep):
+                        for batch_idx, (b_idxs, images, labels, is_cur, cands) in enumerate(local_loader):
+                            step += 1
+                            # Exact momentum multiplier: W_s = (1 - mu^(S - s + 1)) / (1 - mu)
+                            W_s = (1.0 - (momentum ** (S - step + 1))) / (1.0 - momentum)
 
-                        loss = self._training_loss(logits, labels, is_cur, b_idxs, client_ds)
+                            # Keep exact trajectory derivatives in FP32 for the invariant gate.
+                            images = self._prepare_images(images)
+                            labels = labels.cuda(non_blocking=True)
 
-                        # Exact derivative of optimized scalar loss with respect to logits
-                        q = torch.autograd.grad(loss, logits, retain_graph=True)[0]
+                            # Capture head parameters before update step for weight decay attribution
+                            theta_head = torch.cat([
+                                local_model.fc.weight.data.flatten(),
+                                local_model.fc.bias.data.flatten()
+                            ]).detach().cpu()
 
-                        # Current-task sample gradients & trajectory contribution
-                        is_cur_bool = is_cur.bool()
-                        if is_cur_bool.any():
-                            cur_q = q[is_cur_bool]
-                            cur_h = features[is_cur_bool]
-                            cur_cands = cands[is_cur_bool].numpy()
+                            outputs = forward_model(images)
+                            features = outputs["features"]
+                            logits = outputs["logits"]
 
-                            # Batch outer product vec(q_i h_i^T)
-                            cur_grad_W = torch.bmm(cur_q.unsqueeze(2), cur_h.unsqueeze(1)).flatten(start_dim=1)
-                            cur_g = torch.cat([cur_grad_W, cur_q], dim=1)
+                            loss = self._training_loss(logits, labels, is_cur, b_idxs, client_ds)
 
-                            # delta v_i,s = -eta_a * p_k * W_s * g_i,s
+                            # Exact derivative of optimized scalar loss with respect to logits
+                            q = torch.autograd.grad(loss, logits, retain_graph=True)[0]
+
+                            # Current-task sample gradients & trajectory contribution
+                            is_cur_bool = is_cur.bool()
+                            if is_cur_bool.any():
+                                cur_q = q[is_cur_bool]
+                                cur_h = features[is_cur_bool]
+                                cur_cands = cands[is_cur_bool].numpy()
+
+                                # Batch outer product vec(q_i h_i^T)
+                                cur_grad_W = torch.bmm(cur_q.unsqueeze(2), cur_h.unsqueeze(1)).flatten(start_dim=1)
+                                cur_g = torch.cat([cur_grad_W, cur_q], dim=1)
+
+                                # delta v_i,s = -eta_a * p_k * W_s * g_i,s
+                                step_coeff = -current_lr * p_k * W_s
+                                delta_v = step_coeff * cur_g
+                                self.trajectory_matrix[cur_cands] += delta_v.detach().cpu()
+
+                                g_cur_sum = cur_g.sum(dim=0).detach().cpu()
+                            else:
+                                g_cur_sum = torch.zeros(D, dtype=torch.float32)
+
+                            # Replay sample gradients (participate in training & invariant check)
+                            rep_bool = ~is_cur_bool
+                            if rep_bool.any():
+                                rep_q = q[rep_bool]
+                                rep_h = features[rep_bool]
+                                rep_grad_W = torch.bmm(rep_q.unsqueeze(2), rep_h.unsqueeze(1)).flatten(start_dim=1)
+                                rep_g = torch.cat([rep_grad_W, rep_q], dim=1)
+                                g_rep_sum = rep_g.sum(dim=0).detach().cpu()
+                            else:
+                                g_rep_sum = torch.zeros(D, dtype=torch.float32)
+
                             step_coeff = -current_lr * p_k * W_s
-                            delta_v = step_coeff * cur_g
-                            self.trajectory_matrix[cur_cands] += delta_v.detach().cpu()
+                            round_delta_cur += step_coeff * g_cur_sum
+                            round_delta_rep += step_coeff * g_rep_sum
+                            round_delta_wd += (step_coeff * weight_decay) * theta_head
 
-                            g_cur_sum = cur_g.sum(dim=0).detach().cpu()
+                            optimizer.zero_grad(set_to_none=True)
+                            loss.backward()
+                            optimizer.step()
+
+                    local_weights.append(copy.deepcopy(local_model.state_dict()))
+                    del local_loader, forward_model, local_model
+
+                # FedAvg aggregation
+                if self.sample_weighted_fedavg:
+                    global_weights = copy.deepcopy(local_weights[0])
+                    for key in global_weights:
+                        if global_weights[key].is_floating_point():
+                            global_weights[key] = sum((local_weights[i][key] * client_weights[i] for i in range(len(local_weights))), torch.zeros_like(global_weights[key]))
                         else:
-                            g_cur_sum = torch.zeros(D, dtype=torch.float32)
+                            global_weights[key] = sum((local_weights[i][key].float() * client_weights[i] for i in range(len(local_weights))), torch.zeros_like(global_weights[key], dtype=torch.float32)).round().to(global_weights[key].dtype)
+                else:
+                    global_weights = average_weights(local_weights)
+                self._network.load_state_dict(global_weights)
+                scheduler.step()
 
-                        # Replay sample gradients (participate in training & invariant check)
-                        rep_bool = ~is_cur_bool
-                        if rep_bool.any():
-                            rep_q = q[rep_bool]
-                            rep_h = features[rep_bool]
-                            rep_grad_W = torch.bmm(rep_q.unsqueeze(2), rep_h.unsqueeze(1)).flatten(start_dim=1)
-                            rep_g = torch.cat([rep_grad_W, rep_q], dim=1)
-                            g_rep_sum = rep_g.sum(dim=0).detach().cpu()
-                        else:
-                            g_rep_sum = torch.zeros(D, dtype=torch.float32)
+                # Measure actual FedAvg classifier head delta
+                head_after = torch.cat([
+                    self._network.fc.weight.data.flatten(),
+                    self._network.fc.bias.data.flatten()
+                ]).detach().cpu()
 
-                        step_coeff = -current_lr * p_k * W_s
-                        round_delta_cur += step_coeff * g_cur_sum
-                        round_delta_rep += step_coeff * g_rep_sum
-                        round_delta_wd += (step_coeff * weight_decay) * theta_head
+                actual_delta_a = head_after - head_before
+                pred_delta_a = round_delta_cur + round_delta_rep + round_delta_wd
 
-                        optimizer.zero_grad(set_to_none=True)
-                        loss.backward()
-                        optimizer.step()
+                # Normalized round invariant error: E_a = ||pred - actual|| / (||actual|| + eps)
+                err_a = (torch.norm(pred_delta_a - actual_delta_a) / (torch.norm(actual_delta_a) + 1e-8)).item()
+                round_errors.append(err_a)
 
-                local_weights.append(copy.deepcopy(local_model.state_dict()))
-                del local_loader, forward_model, local_model
+                task_pred_delta_theta += pred_delta_a
+                task_actual_delta_theta += actual_delta_a
 
-            # FedAvg aggregation
-            if self.sample_weighted_fedavg:
-                global_weights = copy.deepcopy(local_weights[0])
-                for key in global_weights:
-                    if global_weights[key].is_floating_point():
-                        global_weights[key] = sum((local_weights[i][key] * client_weights[i] for i in range(len(local_weights))), torch.zeros_like(global_weights[key]))
-                    else:
-                        global_weights[key] = sum((local_weights[i][key].float() * client_weights[i] for i in range(len(local_weights))), torch.zeros_like(global_weights[key], dtype=torch.float32)).round().to(global_weights[key].dtype)
-            else:
-                global_weights = average_weights(local_weights)
-            self._network.load_state_dict(global_weights)
-            scheduler.step()
-
-            # Measure actual FedAvg classifier head delta
-            head_after = torch.cat([
-                self._network.fc.weight.data.flatten(),
-                self._network.fc.bias.data.flatten()
-            ]).detach().cpu()
-
-            actual_delta_a = head_after - head_before
-            pred_delta_a = round_delta_cur + round_delta_rep + round_delta_wd
-
-            # Normalized round invariant error: E_a = ||pred - actual|| / (||actual|| + eps)
-            err_a = (torch.norm(pred_delta_a - actual_delta_a) / (torch.norm(actual_delta_a) + 1e-8)).item()
-            round_errors.append(err_a)
-
-            task_pred_delta_theta += pred_delta_a
-            task_actual_delta_theta += actual_delta_a
-
-            if self._should_evaluate(com):
-                test_acc = self._compute_accuracy(self._network, self.test_loader)
-                info = f"Task {self._cur_task}, Round {com + 1}/{com_round} => Test_accy {test_acc:.2f} | E_a: {err_a:.2e}"
-                prog_bar.set_description(info)
-                if self.wandb == 1 and wandb is not None:
-                    wandb.log({
-                        f"Task_{self._cur_task}/accuracy": test_acc,
-                        f"Task_{self._cur_task}/E_a": err_a,
-                    })
+                if self._should_evaluate(com):
+                    test_acc = self._compute_accuracy(self._network, self.test_loader)
+                    info = f"Task {self._cur_task}, Round {com + 1}/{com_round} => Test_accy {test_acc:.2f} | E_a: {err_a:.2e}"
+                    prog_bar.set_description(info)
+                    if self.wandb == 1 and wandb is not None:
+                        wandb.log({
+                            f"Task_{self._cur_task}/accuracy": test_acc,
+                            f"Task_{self._cur_task}/E_a": err_a,
+                        })
+        finally:
+            # Explicitly stop worker processes before starting a new task.
+            # _shutdown_workers is PyTorch's private DataLoader API.
+            for _cached_loader in _client_loader_cache.values():
+                _cached_iter = getattr(_cached_loader, '_iterator', None)
+                if _cached_iter is not None:
+                    try:
+                        _cached_iter._shutdown_workers()
+                    except Exception as _cleanup_error:
+                        logging.warning('Persistent DataLoader worker cleanup: %s', _cleanup_error)
+                    finally:
+                        _cached_loader._iterator = None
+            _client_loader_cache.clear()
 
         # Check Attribution Invariant Validation Gate
         task_err = (torch.norm(task_pred_delta_theta - task_actual_delta_theta) /
