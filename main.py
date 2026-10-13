@@ -96,12 +96,29 @@ def train(args):
         cnn_curve["top1"].append(cnn_accy["top1"])
         print("CNN top1 curve: {}".format(cnn_curve["top1"]))
 
+        if args.get("save_global_models", True):
+            task_model_path = os.path.join("run", "global_models", f"task{task}.pt")
+            saved = save_task_checkpoint(task_model_path, learner, run_config,
+                                         task + 1, total_tasks, cnn_curve)
+            print("Saved global model checkpoint: {} (task {} complete)".format(
+                saved, task))
+
     if checkpointing:
         saved = save_task_checkpoint(checkpoint_path, learner, run_config,
                                      stop_task, total_tasks, cnn_curve)
         print("Saved task checkpoint: {} ({} of {} tasks complete)".format(
             saved, stop_task, total_tasks))
     return cnn_curve
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif isinstance(v, str) and v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
 def args_parser():
@@ -125,6 +142,8 @@ def args_parser():
                         help='continue from a task checkpoint (default: save_dir/task_resume.pt)')
     parser.add_argument('--checkpoint_path', type=str, default=None,
                         help='task-boundary checkpoint output path')
+    parser.add_argument('--save_global_models', nargs='?', const=True, default=True, type=str2bool,
+                        help='save global models after each task to run/global_models/taskx.pt (default: True)')
 
     # federated continual learning settings
     parser.add_argument('--dataset', type=str, default="cifar100", help='which dataset')

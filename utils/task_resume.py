@@ -19,7 +19,7 @@ TRANSIENT_FIELDS = {
     "test_loader", "old_loader", "new_loader", "syn_data_loader",
     "pre_loader", "train_dataset", "logger", "_active_tracker", "_t4_scaler",
 }
-RUNTIME_ARGS = {"num_tasks_to_run", "resume", "checkpoint_path", "class_order"}
+RUNTIME_ARGS = {"num_tasks_to_run", "resume", "checkpoint_path", "class_order", "save_global_models"}
 
 
 def source_fingerprints():
@@ -147,6 +147,7 @@ def save_task_checkpoint(path, learner, args, completed, total_tasks, cnn_curve)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     scaler = getattr(learner, "_t4_scaler", None)
+    network = getattr(learner, "_network", None)
     checkpoint = {
         "format_version": FORMAT_VERSION,
         "learner_type": type(learner).__name__,
@@ -163,6 +164,8 @@ def save_task_checkpoint(path, learner, args, completed, total_tasks, cnn_curve)
         "lander_images": _lander_images(learner, completed),
         "sidecar_files": _sidecar_files(learner),
         "rng": rng_state(),
+        "model": network,
+        "model_state_dict": {k: v.detach().clone().cpu() for k, v in network.state_dict().items()} if network is not None else None,
     }
     # An interrupted write must leave the previous complete checkpoint usable.
     with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as stream:
@@ -219,3 +222,27 @@ def load_task_checkpoint(path, args, data_manager, learner_type):
     # DataManager construction and deserialization may consume random numbers.
     restore_rng(state["rng"])
     return learner, completed, state["cnn_curve"]
+
+
+def load_task_model(path, map_location=None):
+    """Load the global model from a task checkpoint for inference.
+
+    Args:
+        path: Path to taskx.pt or task_resume.pt checkpoint.
+        map_location: Target device or mapping (passed to torch.load).
+
+    Returns:
+        The trained torch.nn.Module (IncrementalNet) in eval mode.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError("Checkpoint not found: {}".format(path))
+    state = torch.load(path, map_location=map_location, weights_only=False)
+    if "model" in state and isinstance(state["model"], torch.nn.Module):
+        model = state["model"]
+    elif "learner_state" in state and "_network" in state["learner_state"]:
+        model = state["learner_state"]["_network"]
+    else:
+        raise ValueError("No model found in checkpoint: {}".format(path))
+    model.eval()
+    return model
