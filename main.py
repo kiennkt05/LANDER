@@ -225,6 +225,31 @@ def args_parser():
     exp5_loss.add_argument('--repo_dual', action='store_true', help='use FedCBDR repo_dual TTS loss in Exp5 with tau_old/tau_new and w_old/w_new')
     exp5_loss.add_argument('--exp5_distill_loss', action='store_true', help='use current-sample CE and replay MSE, refreshing all replay logits after each task')
     exp5_loss.add_argument('--exp5_single_distill_loss', action='store_true', help='use current-sample CE and replay MSE, capturing logits only once from each replay item\'s original task best model')
+    
+    parser.add_argument('--logits_mode', default='none',
+                        choices=['none', 'LTE_margin', 'proto_margin', 'global_margin'],
+                        help='Exp5-family local logit objective (none preserves the existing loss)')
+    parser.add_argument('--logits_lambda', type=float, default=0.1,
+                        help='negative-class relational KL weight')
+    parser.add_argument('--logits_gamma', type=float, default=0.5,
+                        help='student logit margin hinge weight')
+    parser.add_argument('--logits_temperature', type=float, default=2.0,
+                        help='teacher and student relational KL temperature')
+    parser.add_argument('--logits_margin', type=float, default=1.0,
+                        help='required gap between true and strongest negative student logit')
+    parser.add_argument('--logits_warmup', type=int, default=10,
+                        help='CE-only communication rounds at the start of each task')
+    parser.add_argument('--logits_refresh', type=int, default=5,
+                        help='round interval for refreshing visual class prototypes')
+    parser.add_argument('--logits_proto_bs', type=int, default=256,
+                        help='batch size for visual prototype extraction')
+    parser.add_argument('--logits_lte_path', type=str, default=None,
+                        help='trusted label embedding pickle for LTE_margin (default: dataset asset)')
+    parser.add_argument('--logits_output_dir', type=str, default='',
+                        help='optional directory for per-task teacher targets and diagnostics')
+    parser.add_argument('--logits_probe_rounds', type=str, default='',
+                        help='optional comma-separated rounds for class-wise diagnostics')
+    
     parser.add_argument('--gdr_task_budget', default=None, type=int, help='replay budget M per task')
     parser.add_argument('--exp5a_rank', default=128, type=int, help='projection rank r')
     parser.add_argument('--exp5a_svd_oversampling', default=16, type=int, help='randomized-PCA oversampling p')
@@ -253,6 +278,29 @@ def args_parser():
         parser.error('--synthesis_eval_interval must be a positive integer')
     if args.num_tasks_to_run is not None and args.num_tasks_to_run < 1:
         parser.error('--num_tasks_to_run must be a positive integer')
+    if args.logits_mode != 'none':
+        if args.method.lower() not in {
+            'exp5a_local', 'exp5a_global', 'exp5b_topk', 'exp5b_fedcbdr',
+            'exp6_global', 'exp6b_global',
+        }:
+            parser.error('--logits_mode is supported only by Exp5-family methods')
+        if args.repo_dual or args.exp5_distill_loss or args.exp5_single_distill_loss:
+            parser.error('--logits_mode requires the original Exp5 CE loss')
+        if args.logits_lambda < 0 or args.logits_gamma < 0 or args.logits_margin < 0:
+            parser.error('logits loss weights and student margin must be nonnegative')
+        if args.logits_temperature <= 0:
+            parser.error('logits temperature must be positive')
+        if args.logits_warmup < 0 or args.logits_refresh < 1 or args.logits_proto_bs < 1:
+            parser.error('invalid logits warmup, refresh interval, or prototype batch size')
+        if args.logits_probe_rounds and not args.logits_output_dir:
+            parser.error('--logits_probe_rounds requires --logits_output_dir')
+        try:
+            probe_rounds = [int(part.strip()) for part in args.logits_probe_rounds.split(',')
+                            if part.strip()]
+        except ValueError:
+            parser.error('--logits_probe_rounds must be comma-separated positive integers')
+        if any(round_id < 1 for round_id in probe_rounds):
+            parser.error('--logits_probe_rounds must contain positive round numbers')
 
     return args
 

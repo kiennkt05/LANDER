@@ -128,6 +128,45 @@ for both segments. Resume checks the code, environment, task count, class order,
 and training arguments before loading. Deterministic kernels may run more slowly;
 PyTorch can raise an error if an operation has no deterministic implementation.
 
+## FedAvg_Test logit objectives for Exp5
+
+The Exp5-family methods accept `--logits_mode` with `none` (default),
+`LTE_margin`, `proto_margin`, or `global_margin`. `none` runs the existing Exp5
+loss and training path. The other modes add the FedAvg_Test negative-class
+relational KL and student logit margin to the original cross-entropy loss.
+They apply to both current-task and retained replay batches. The modes are
+available for `exp5a_local`, `exp5a_global`, `exp5b_topk`, `exp5b_fedcbdr`,
+`exp6_global`, and `exp6b_global`. Other methods reject a non-`none` mode.
+
+| Mode | Teacher for the negative-class KL |
+| --- | --- |
+| `LTE_margin` | Fixed label-text embeddings, reordered by the FCIL class order. This corresponds to FedAvg_Test's `cosine_margin`. |
+| `proto_margin` | Class means from the pre-round global encoder, current training images, and retained replay images. |
+| `global_margin` | Detached pre-round global model logits on each local batch. |
+
+The prototype mode requires at least one current or retained image for every
+seen class and raises an error if coverage is missing. The first 10 rounds of
+each task use only the original CE loss by default. `--logits_lambda` (0.1),
+`--logits_gamma` (0.5), `--logits_temperature` (2), and `--logits_margin` (1)
+control the objective. `--logits_warmup` (10), `--logits_refresh` (5), and
+`--logits_proto_bs` (256) control the prototype schedule. `--logits_lte_path`
+can select a trusted LTE pickle; otherwise the repository's
+`label_embedding/<dataset>_le.pickle` is used. These modes require the
+original Exp5 CE loss, so they cannot be combined with `--repo_dual`,
+`--exp5_distill_loss`, or `--exp5_single_distill_loss`.
+
+For example:
+
+```bash
+python main.py --dataset=cifar100 --method=exp5a_global --tasks=10 \
+  --logits_mode=LTE_margin --fedcbdr_lr_scheduler=cosine
+```
+
+Pass `--logits_output_dir=<directory>` to save task-specific targets and
+diagnostics. `--logits_probe_rounds=20,50,100` additionally computes the
+FedAvg_Test class-wise test probes at those communication rounds. Both are
+disabled by default; the probes add evaluation time but do not enter training.
+
 ## Baseline
 Here, we provide a simple example for different methods. 
 For example, for `cifar100-5tasks`, please run the following commands to test the model performance with non-IID (`$\beta=0.5$`) data.

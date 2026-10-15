@@ -318,6 +318,10 @@ class Exp5Base(BaseLearner):
 
     def _fl_train(self, train_dataset, user_groups, offsets, D):
         """Runs federated training rounds, accumulating exact sample trajectories."""
+        logits_experiment = None
+        if self.args.get("logits_mode", "none") != "none":
+            from logits_lab.runtime import PrototypeExperiment
+            logits_experiment = PrototypeExperiment(self, train_dataset, user_groups)
         com_round = self.args["com_round"]
         prog_bar = tqdm(range(com_round), desc=f"Task {self._cur_task} FL Training")
 
@@ -340,6 +344,8 @@ class Exp5Base(BaseLearner):
         try:
             for com in prog_bar:
                 current_lr = scheduler.get_last_lr()[0]
+                if logits_experiment is not None:
+                    logits_experiment.start_round(com + 1, self._network)
                 # Snapshot head parameters before local training
                 head_before = torch.cat([
                     self._network.fc.weight.data.flatten(),
@@ -421,6 +427,9 @@ class Exp5Base(BaseLearner):
                             logits = outputs["logits"]
 
                             loss = self._training_loss(logits, labels, is_cur, b_idxs, client_ds)
+                            if logits_experiment is not None:
+                                loss = logits_experiment.augment_loss(
+                                    loss, logits, labels, images, self._network)
 
                             # Exact derivative of optimized scalar loss with respect to logits
                             q = torch.autograd.grad(loss, logits, retain_graph=True)[0]
@@ -466,6 +475,8 @@ class Exp5Base(BaseLearner):
                             optimizer.step()
 
                     local_weights.append(copy.deepcopy(local_model.state_dict()))
+                    if logits_experiment is not None:
+                        logits_experiment.after_client(k, local_model)
                     del local_loader, forward_model, local_model
 
                 # FedAvg aggregation
@@ -479,6 +490,8 @@ class Exp5Base(BaseLearner):
                 else:
                     global_weights = average_weights(local_weights)
                 self._network.load_state_dict(global_weights)
+                if logits_experiment is not None:
+                    logits_experiment.after_aggregation(self._network)
                 scheduler.step()
 
                 # Measure actual FedAvg classifier head delta
@@ -499,6 +512,8 @@ class Exp5Base(BaseLearner):
 
                 if self._should_evaluate(com):
                     test_acc = self._compute_accuracy(self._network, self.test_loader)
+                    if logits_experiment is not None:
+                        logits_experiment.after_evaluation(test_acc, err_a)
                     info = f"Task {self._cur_task}, Round {com + 1}/{com_round} => Test_accy {test_acc:.2f} | E_a: {err_a:.2e}"
                     prog_bar.set_description(info)
                     if self.wandb == 1 and wandb is not None:

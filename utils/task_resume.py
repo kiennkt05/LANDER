@@ -28,7 +28,7 @@ def source_fingerprints():
         str(path.relative_to(root)).replace("\\", "/"): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted(root.rglob("*.py"))
         if (path.name == "main.py" or
-            path.relative_to(root).parts[0] in {"methods", "utils", "convs"})
+            path.relative_to(root).parts[0] in {"methods", "utils", "convs", "logits_lab"})
     }
 
 
